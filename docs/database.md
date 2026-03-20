@@ -6,286 +6,262 @@
 
 | Component | Library | Version |
 |---|---|---|
-| PostgreSQL driver | `pgx` | v5 |
-| SQL query generation | `sqlc` | latest |
-| Migrations | `golang-migrate` | v4 |
-| Connection pooling | `pgxpool` (bundled with pgx) | — |
+| ORM | **Prisma** | v5 |
+| Database | PostgreSQL 15+ | — |
+| Connection pooling | PgBouncer (external) or Prisma Accelerate | — |
 
-> **Database of choice:** PostgreSQL 15+. No other relational database is approved without Platform Engineering sign-off.
+> **Why Prisma?** Prisma provides a type-safe, schema-first ORM with an excellent migration system, auto-generated TypeScript types, and strong support for PostgreSQL. It eliminates raw SQL string hazards while keeping queries readable and explicit.
 
 ---
 
-## Connection Setup
+## Setup
 
-### Using `pgxpool`
+```bash
+pnpm add @prisma/client
+pnpm add -D prisma
+npx prisma init
+```
 
-Always use `pgxpool` (not a raw `pgx.Conn`) for production services. The pool manages multiple connections, handles reconnection, and respects context cancellation.
+---
 
-```go
-package database
+## Prisma Schema
 
-import (
-    "context"
-    "fmt"
-    "time"
+The `prisma/schema.prisma` file is the **single source of truth** for your database schema and generated types.
 
-    "github.com/jackc/pgx/v5/pgxpool"
-)
+```prisma
+// apps/api/prisma/schema.prisma
 
-type Config struct {
-    DSN             string
-    MaxConns        int32
-    MinConns        int32
-    MaxConnLifetime time.Duration
-    MaxConnIdleTime time.Duration
+generator client {
+  provider = "prisma-client-js"
 }
 
-func NewPool(ctx context.Context, cfg Config) (*pgxpool.Pool, error) {
-    poolCfg, err := pgxpool.ParseConfig(cfg.DSN)
-    if err != nil {
-        return nil, fmt.Errorf("parse database config: %w", err)
-    }
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
 
-    poolCfg.MaxConns = cfg.MaxConns           // Default: 10
-    poolCfg.MinConns = cfg.MinConns           // Default: 2
-    poolCfg.MaxConnLifetime = cfg.MaxConnLifetime // Default: 1h
-    poolCfg.MaxConnIdleTime = cfg.MaxConnIdleTime // Default: 30m
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  name      String
+  role      UserRole  @default(VIEWER)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
 
-    // Validate connectivity at startup
-    pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-    if err != nil {
-        return nil, fmt.Errorf("create connection pool: %w", err)
-    }
+  @@map("users")
+}
 
-    if err := pool.Ping(ctx); err != nil {
-        return nil, fmt.Errorf("ping database: %w", err)
-    }
-
-    return pool, nil
+enum UserRole {
+  ADMIN
+  EDITOR
+  VIEWER
 }
 ```
 
-### Recommended Pool Sizing
+### Schema Rules
 
-| Service Type | MaxConns | MinConns |
+- Every model has an `id` field using `@default(cuid())` or `@default(uuid())`.
+- Soft deletes use a nullable `deletedAt` field — never hard-delete user data without review.
+- Always define `createdAt` and `updatedAt` on mutable entities.
+- Use `@@map("snake_case_table_name")` to keep table names `snake_case` even when the Prisma model is `PascalCase`.
+- Define a `@@index` for every foreign key and commonly filtered column.
+
+---
+
+## Prisma Client Setup (Fastify Plugin)
+
+```typescript
+// apps/api/src/plugins/prisma.ts
+import fp from "fastify-plugin";
+import { FastifyPluginAsync } from "fastify";
+import { PrismaClient } from "@prisma/client";
+
+declare module "fastify" {
+  interface FastifyInstance {
+    prisma: PrismaClient;
+  }
+}
+
+const prismaPlugin: FastifyPluginAsync = fp(async (server) => {
+  const prisma = new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? [{ emit: "event", level: "query" }, "warn", "error"]
+        : ["warn", "error"],
+  });
+
+  if (process.env.NODE_ENV === "development") {
+    prisma.$on("query", (e) => {
+      server.log.debug({ query: e.query, params: e.params, durationMs: e.duration }, "prisma query");
+    });
+  }
+
+  await prisma.$connect();
+
+  server.decorate("prisma", prisma);
+
+  server.addHook("onClose", async () => {
+    await prisma.$disconnect();
+  });
+});
+
+export { prismaPlugin };
+```
+
+---
+
+## Repository Pattern
+
+Wrap Prisma calls in repository classes to keep routes and services free of ORM details, and to make testing easier.
+
+```typescript
+// apps/api/src/repositories/user-repository.ts
+import { PrismaClient, User, Prisma } from "@prisma/client";
+import { NotFoundError, ConflictError } from "../domain/errors.js";
+
+export class UserRepository {
+  constructor(private readonly db: PrismaClient) {}
+
+  async findById(id: string): Promise<User> {
+    const user = await this.db.user.findFirst({
+      where: { id, deletedAt: null },
+    });
+    if (!user) throw new NotFoundError(`User ${id} not found`);
+    return user;
+  }
+
+  async findAll(params: { limit: number; cursor?: string }): Promise<User[]> {
+    return this.db.user.findMany({
+      where: { deletedAt: null },
+      take: params.limit,
+      ...(params.cursor && {
+        skip: 1,
+        cursor: { id: params.cursor },
+      }),
+      orderBy: { createdAt: "desc" },
+    });
+  }
+
+  async create(data: Prisma.UserCreateInput): Promise<User> {
+    try {
+      return await this.db.user.create({ data });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === "P2002"
+      ) {
+        throw new ConflictError("Email already exists");
+      }
+      throw err;
+    }
+  }
+
+  async softDelete(id: string): Promise<void> {
+    await this.db.user.update({
+      where: { id },
+      data: { deletedAt: new Date() },
+    });
+  }
+}
+```
+
+### Prisma Error Codes to Domain Errors
+
+Always translate Prisma errors to domain errors at the repository boundary:
+
+| Prisma Code | Meaning | Domain Error |
 |---|---|---|
-| Low-traffic API | 5 | 1 |
-| Standard API | 10 | 2 |
-| High-traffic API | 25 | 5 |
-| Background worker | 3 | 1 |
+| `P2002` | Unique constraint violation | `ConflictError` |
+| `P2003` | Foreign key constraint violation | `DependencyError` |
+| `P2025` | Record not found (update/delete) | `NotFoundError` |
 
 ---
 
-## Query Generation with `sqlc`
+## Migrations
 
-RBKL does **not** use ORM magic (no GORM, no `ent`). Instead, write raw SQL and use `sqlc` to generate type-safe Go code.
+Use `prisma migrate` for all schema changes.
 
-### Why `sqlc`?
+### Development Workflow
 
-- SQL is the source of truth — no surprises in generated queries.
-- Full type safety — mismatches between Go types and SQL column types are caught at code-generation time.
-- No runtime reflection overhead.
-- Queries are readable, reviewable, and optimizable.
+```bash
+# After editing schema.prisma:
+npx prisma migrate dev --name create_users_table
+# This creates a migration file AND applies it to the dev DB
 
-### `sqlc.yaml` Configuration
-
-```yaml
-version: "2"
-sql:
-  - engine: "postgresql"
-    queries: "internal/repository/queries/"
-    schema: "migrations/"
-    gen:
-      go:
-        package: "repository"
-        out: "internal/repository"
-        emit_json_tags: true
-        emit_pointers_for_null_types: true
-        emit_methods_with_db_argument: false
-        emit_interface: true
+# Generate/regenerate the Prisma Client after schema changes
+npx prisma generate
 ```
 
-### Query File Example (`internal/repository/queries/users.sql`)
+### Production Deployment
 
-```sql
--- name: GetUser :one
-SELECT id, email, name, created_at, updated_at
-FROM users
-WHERE id = $1 AND deleted_at IS NULL;
-
--- name: ListUsers :many
-SELECT id, email, name, created_at, updated_at
-FROM users
-WHERE deleted_at IS NULL
-ORDER BY created_at DESC
-LIMIT $1 OFFSET $2;
-
--- name: CreateUser :one
-INSERT INTO users (id, email, name, created_at, updated_at)
-VALUES ($1, $2, $3, NOW(), NOW())
-RETURNING *;
-
--- name: SoftDeleteUser :exec
-UPDATE users SET deleted_at = NOW() WHERE id = $1;
+```bash
+# Apply pending migrations to production (no prompt, no dev-only features)
+npx prisma migrate deploy
 ```
 
-### Generated Repository Usage
-
-```go
-// sqlc generates this interface automatically
-type Querier interface {
-    GetUser(ctx context.Context, id uuid.UUID) (User, error)
-    ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error)
-    CreateUser(ctx context.Context, arg CreateUserParams) (User, error)
-    SoftDeleteUser(ctx context.Context, id uuid.UUID) error
-}
-
-// In your service layer:
-func (s *UserService) Get(ctx context.Context, id uuid.UUID) (*domain.User, error) {
-    row, err := s.db.GetUser(ctx, id)
-    if err != nil {
-        if errors.Is(err, pgx.ErrNoRows) {
-            return nil, domain.ErrNotFound
-        }
-        return nil, fmt.Errorf("get user %s: %w", id, err)
-    }
-    return toDomain(row), nil
-}
-```
+**Rules:**
+- Never edit a migration file after it has been committed to `main`.
+- Every schema change goes through a new migration.
+- `prisma migrate deploy` runs automatically in the CI/CD pipeline before starting the application.
+- Migrations are run in a separate step with its own approval gate in production (see [CI/CD](ci-cd.md)).
 
 ---
 
-## Migrations with `golang-migrate`
+## Transactions
 
-### File Naming
+Use `prisma.$transaction()` for multi-step operations that must be atomic.
 
-```
-migrations/
-├── 000001_create_users.up.sql
-├── 000001_create_users.down.sql
-├── 000002_add_users_email_index.up.sql
-└── 000002_add_users_email_index.down.sql
-```
+```typescript
+// Sequential transaction (auto-rollback on error)
+const [user, profile] = await this.db.$transaction([
+  this.db.user.create({ data: userData }),
+  this.db.profile.create({ data: profileData }),
+]);
 
-Rules:
-- Use sequential 6-digit zero-padded integers.
-- Every `up` migration **must** have a matching `down` migration.
-- Migrations are **immutable** once merged to `main`. Never edit an existing migration — create a new one.
-- `down` migrations should fully reverse the `up` migration.
+// Interactive transaction (for conditional logic)
+await this.db.$transaction(async (tx) => {
+  const from = await tx.account.update({
+    where: { id: fromId },
+    data: { balance: { decrement: amount } },
+  });
 
-### Running Migrations
+  if (from.balance < 0) {
+    throw new Error("Insufficient balance"); // Triggers rollback
+  }
 
-```go
-package database
-
-import (
-    "fmt"
-
-    "github.com/golang-migrate/migrate/v4"
-    _ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
-    _ "github.com/golang-migrate/migrate/v4/source/file"
-)
-
-func Migrate(databaseURL string) error {
-    m, err := migrate.New("file://migrations", databaseURL)
-    if err != nil {
-        return fmt.Errorf("create migrator: %w", err)
-    }
-    defer m.Close()
-
-    if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-        return fmt.Errorf("run migrations: %w", err)
-    }
-
-    return nil
-}
+  await tx.account.update({
+    where: { id: toId },
+    data: { balance: { increment: amount } },
+  });
+});
 ```
 
-Migrations run **automatically at application startup** in all environments except production. In production, migrations are a separate, gated pipeline step.
-
----
-
-## Transaction Handling
-
-### Standard Transaction Pattern
-
-```go
-func (r *UserRepository) TransferBalance(ctx context.Context, fromID, toID uuid.UUID, amount int64) error {
-    return pgx.BeginTxFunc(ctx, r.pool, pgx.TxOptions{
-        IsoLevel:   pgx.ReadCommitted,
-        AccessMode: pgx.ReadWrite,
-    }, func(tx pgx.Tx) error {
-        qtx := r.queries.WithTx(tx)
-
-        if err := qtx.DeductBalance(ctx, DeductBalanceParams{ID: fromID, Amount: amount}); err != nil {
-            return fmt.Errorf("deduct from %s: %w", fromID, err)
-        }
-        if err := qtx.AddBalance(ctx, AddBalanceParams{ID: toID, Amount: amount}); err != nil {
-            return fmt.Errorf("add to %s: %w", toID, err)
-        }
-
-        return nil
-    })
-}
-```
-
-- Use `pgx.BeginTxFunc` — it automatically commits on success or rolls back on error.
-- Always specify the transaction isolation level explicitly.
-- Keep transactions short — no network calls inside a transaction.
-
----
-
-## Error Handling
-
-Always translate database errors to domain errors at the repository boundary:
-
-```go
-import (
-    "github.com/jackc/pgx/v5"
-    "github.com/jackc/pgx/v5/pgconn"
-)
-
-func toAppError(err error) error {
-    if err == nil {
-        return nil
-    }
-    if errors.Is(err, pgx.ErrNoRows) {
-        return domain.ErrNotFound
-    }
-    var pgErr *pgconn.PgError
-    if errors.As(err, &pgErr) {
-        switch pgErr.Code {
-        case "23505": // unique_violation
-            return domain.ErrConflict
-        case "23503": // foreign_key_violation
-            return domain.ErrDependencyExists
-        }
-    }
-    return err // Unexpected error — propagate as-is
-}
-```
+- Keep transactions as short as possible — no external HTTP calls inside a transaction.
+- Use interactive transactions (`$transaction(async (tx) => {...})`) when you need to inspect intermediate results.
 
 ---
 
 ## Prohibited Patterns
 
-```go
-// ❌ String interpolation in SQL queries — SQL injection risk
-query := fmt.Sprintf("SELECT * FROM users WHERE email = '%s'", email)
+```typescript
+// ❌ Raw SQL string interpolation — SQL injection risk
+await prisma.$queryRawUnsafe(`SELECT * FROM users WHERE email = '${email}'`);
 
-// ❌ Raw pgxpool.Conn — use the query interface
-conn, _ := pool.Acquire(ctx)
-conn.Exec(ctx, "SELECT ...")
+// ❌ Using Prisma client directly in route handlers
+server.get("/users/:id", async (req) => {
+  return server.prisma.user.findFirst({ where: { id: req.params.id } }); // Bypass repository
+});
 
-// ❌ SELECT * — always list columns explicitly
-db.Query("SELECT * FROM users")
+// ❌ Catching all errors generically
+try {
+  await repo.create(data);
+} catch {
+  throw new Error("Something went wrong"); // Loses error type
+}
 
-// ❌ Ignoring row.Close() / rows.Close()
-rows, _ := db.Query(ctx, sql)
-// Missing: defer rows.Close()
-
-// ❌ No context on database calls
-db.QueryRow("SELECT ...")  // Use QueryRow(ctx, ...) instead
+// ❌ SELECT * equivalent — always specify select/include explicitly for large models
+await prisma.user.findMany(); // Returns all fields including sensitive ones
 ```
 
 ---

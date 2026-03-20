@@ -2,66 +2,120 @@
 
 ← [Back to README](../README.md)
 
-## Go Modules
+## Package Manager
 
-All RBKL Go services use **Go modules** (`go.mod` / `go.sum`). The `go.sum` file is always committed and acts as a cryptographic verification of all dependencies.
+RBKL uses **`pnpm`** exclusively for all JavaScript/TypeScript projects. `npm` and `yarn` are not permitted.
 
+**Why pnpm?**
+- Efficient disk usage via content-addressable store (shared across projects).
+- Strict mode by default — packages cannot access undeclared dependencies.
+- First-class monorepo/workspace support.
+- Faster installs than npm/yarn.
+
+---
+
+## Workspaces
+
+The monorepo is managed with **pnpm workspaces** declared in `pnpm-workspace.yaml`:
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "apps/*"
+  - "packages/*"
 ```
-my-service/
-├── go.mod    # Module declaration, direct dependencies with versions
-└── go.sum    # Checksums for all dependencies (direct + transitive)
+
+Cross-workspace dependencies use the `workspace:` protocol:
+
+```json
+// apps/web/package.json
+{
+  "dependencies": {
+    "@rbkl/ui": "workspace:*",
+    "@rbkl/types": "workspace:*"
+  }
+}
 ```
 
 ---
 
-## Module Naming
+## Node.js Version
 
-Module paths follow the GitHub repository path:
+Pin the Node.js version in `.nvmrc` and `package.json` engines field:
 
-```go
-module github.com/rbkl/my-service
-
-go 1.22
 ```
+# .nvmrc
+20.14.0
+```
+
+```json
+// package.json (root)
+{
+  "engines": {
+    "node": ">=20.14.0",
+    "pnpm": ">=9.0.0"
+  }
+}
+```
+
+Use the LTS release of Node.js. Upgrade within 30 days of a new LTS version becoming active.
 
 ---
 
-## Approved vs. Restricted Dependencies
+## Approved Core Dependencies
 
-### Approved Core Dependencies
+These packages are pre-approved for use in any RBKL application:
 
-These libraries are pre-approved for use in any RBKL service:
+### Backend
 
-| Category | Library | Version | Notes |
+| Category | Package | Version | Notes |
 |---|---|---|---|
-| HTTP Router | `github.com/go-chi/chi/v5` | v5.x | Preferred router |
-| Config | `github.com/spf13/viper` | v1.x | Required |
-| Validation | `github.com/go-playground/validator/v10` | v10.x | Input validation |
-| Database | `github.com/jackc/pgx/v5` | v5.x | PostgreSQL only |
-| Migrations | `github.com/golang-migrate/migrate/v4` | v4.x | Required with pgx |
-| JWT | `github.com/golang-jwt/jwt/v5` | v5.x | Auth |
-| JWKS | `github.com/MicahParks/keyfunc/v3` | v3.x | Auth |
-| Testing | `github.com/stretchr/testify` | v1.x | Required |
-| Mocks | `github.com/vektra/mockery/v2` | v2.x | Code generation |
-| UUID | `github.com/google/uuid` | v1.x | IDs |
-| OpenTelemetry | `go.opentelemetry.io/otel` | v1.x | Tracing |
-| Azure Identity | `github.com/Azure/azure-sdk-for-go/sdk/azidentity` | v1.x | Managed identity |
-| Azure Key Vault | `github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets` | v1.x | Secrets |
+| HTTP framework | `fastify` | v4 | Required |
+| Fastify CORS | `@fastify/cors` | latest | Required |
+| Fastify Helmet | `@fastify/helmet` | latest | Required |
+| Fastify Rate Limit | `@fastify/rate-limit` | latest | Required |
+| Fastify Swagger | `@fastify/swagger` + `@fastify/swagger-ui` | latest | Required |
+| Schema types | `@sinclair/typebox` | latest | With Fastify |
+| Config validation | `zod` | v3 | Required |
+| ORM | `@prisma/client` | v5 | Required |
+| Logging | `pino` | v9 | Required |
+| JWT / JWKS | `jose` | v5 | Required |
+| Azure Identity | `@azure/identity` | v4 | Managed identity |
+| Azure Key Vault | `@azure/keyvault-secrets` | v4 | Secrets |
+| OpenTelemetry | `@opentelemetry/sdk-node` | latest | Tracing |
 
-### Restricted/Prohibited Libraries
+### Frontend
 
-These libraries are **not approved** without explicit Platform Engineering review:
+| Category | Package | Version | Notes |
+|---|---|---|---|
+| UI framework | `react` + `react-dom` | v18 | Required |
+| Build tool | `vite` | v5 | Required |
+| Router | `react-router-dom` | v6 | Required |
+| State management | `zustand` | v4 | Preferred |
+| Server state | `@tanstack/react-query` | v5 | Preferred |
+| Forms | `react-hook-form` | v7 | Required |
+| Zod integration | `@hookform/resolvers` | latest | With react-hook-form |
+| MSAL (auth) | `@azure/msal-browser` + `@azure/msal-react` | v3 | Required |
+| HTML sanitization | `dompurify` | v3 | When needed |
+| HTTP sanitization | `@types/dompurify` | latest | Types |
 
-| Library | Reason |
+---
+
+## Restricted / Prohibited Packages
+
+| Package | Reason |
 |---|---|
-| `github.com/jinzhu/gorm` / `gorm.io/gorm` | Use `sqlc` instead |
-| `github.com/gomodule/redigo` | Use `github.com/redis/go-redis/v9` |
-| `github.com/sirupsen/logrus` | Use stdlib `slog` |
-| `go.uber.org/zap` | Use stdlib `slog` |
-| `github.com/labstack/echo` | Use `chi` |
-| `github.com/gin-gonic/gin` | Use `chi` |
-| `github.com/dgrijalva/jwt-go` | Deprecated and unmaintained; use `golang-jwt/jwt/v5` |
-| `math/rand` (for security) | Use `crypto/rand` for all security-sensitive random generation |
+| `lodash` | Use native ES2022+ methods; if needed use `lodash-es` for tree-shaking |
+| `moment` | Use `date-fns` or `Temporal` API |
+| `request` / `axios` | Use native `fetch` (Node 18+) or `undici` |
+| `sequelize` / `typeorm` | Use Prisma |
+| `winston` / `morgan` | Use Pino |
+| `express` / `koa` | Use Fastify |
+| `passport` | Use `jose` directly |
+| `jsonwebtoken` (legacy) | Use `jose` v5 |
+| `class-validator` | Use Zod |
+| `next` (Next.js) | Not approved without Platform Engineering review |
+| `redux` + `redux-toolkit` | Use Zustand; for complex state open a deviation request |
 
 ---
 
@@ -69,79 +123,43 @@ These libraries are **not approved** without explicit Platform Engineering revie
 
 Before adding any dependency:
 
-1. **Check if the standard library covers it.** Go's stdlib is extensive — avoid unnecessary dependencies.
-2. **Check if an approved library already covers it.** Avoid adding a second library that overlaps with an approved one.
+1. **Check if native APIs cover it.** Node.js 20 includes `fetch`, `structuredClone`, `crypto`, and more.
+2. **Check the approved list above.** Is there already an approved alternative?
 3. **Evaluate the dependency:**
-   - Last commit date (reject if > 12 months without activity and no maintainer statement).
-   - Number of open critical issues.
-   - License compatibility (see below).
-   - Known vulnerabilities (run `govulncheck`).
-4. **Pin the exact version** — no `@latest` or version ranges.
+   - Weekly downloads (stability signal).
+   - Last publish date (reject if > 12 months inactive).
+   - Licence compatibility (see below).
+   - Known vulnerabilities (`pnpm audit`).
+   - Bundle size for frontend packages (use [bundlephobia.com](https://bundlephobia.com)).
+4. **Pin the exact version** — no `^` or `~` ranges in `dependencies` (only in `devDependencies`).
 
-```bash
-# ✅ Correct — pin exact version
-go get github.com/some/library@v1.2.3
+```jsonc
+// ✅ Good — pinned in dependencies
+{ "dependencies": { "some-lib": "1.2.3" } }
 
-# ❌ Wrong — unpinned
-go get github.com/some/library
+// ❌ Bad — floating range
+{ "dependencies": { "some-lib": "^1.2.3" } }
 ```
 
-5. **Open a PR** — dependency additions are visible in `go.mod` and reviewed as part of the PR.
-
----
-
-## Vendoring Policy
-
-RBKL does **not** vendor dependencies by default. The `go.sum` file provides integrity verification. Vendoring adds repository bloat and maintenance overhead.
-
-**Exception:** Security-sensitive services or air-gapped environments may vendor dependencies. Document the reason in the repository README.
-
-```bash
-# Enable vendoring (only when explicitly required)
-go mod vendor
-```
+5. **Open a PR** — dependency additions are visible in `package.json` and reviewed.
 
 ---
 
 ## Version Update Cadence
 
-| Dependency Type | Update Frequency |
+| Dependency Type | Frequency |
 |---|---|
 | Security patches | Within 7 days of disclosure |
-| Direct dependencies (minor/patch) | Monthly, via Dependabot PRs |
-| Direct dependencies (major) | Quarterly, with explicit upgrade plan |
-| Go toolchain | Within 1 month of a new minor release |
-
-### Automated Updates
-
-Dependabot handles routine updates. Configure it as follows:
-
-```yaml
-# .github/dependabot.yml
-version: 2
-updates:
-  - package-ecosystem: "gomod"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-      time: "09:00"
-      timezone: "UTC"
-    open-pull-requests-limit: 10
-    groups:
-      azure-sdk:
-        patterns:
-          - "github.com/Azure/*"
-      otel:
-        patterns:
-          - "go.opentelemetry.io/*"
-```
+| Direct deps (patch/minor) | Monthly, via Dependabot PRs |
+| Direct deps (major) | Quarterly, with explicit upgrade plan |
+| Node.js runtime | Within 30 days of new LTS activation |
+| `pnpm` | With each minor release |
 
 ---
 
 ## License Compliance
 
-RBKL services may only depend on libraries with the following licenses:
+Only these licenses are permitted without explicit legal review:
 
 | License | Permitted |
 |---|---|
@@ -150,35 +168,20 @@ RBKL services may only depend on libraries with the following licenses:
 | BSD 2-Clause | ✅ Yes |
 | BSD 3-Clause | ✅ Yes |
 | ISC | ✅ Yes |
+| CC0 | ✅ Yes |
 | MPL 2.0 | ⚠️ Review required |
 | LGPL | ⚠️ Review required |
-| GPL (any version) | ❌ No |
+| GPL (any) | ❌ No |
 | SSPL | ❌ No |
 | Commons Clause | ❌ No |
-| Proprietary | ❌ No (without explicit legal review) |
+| Proprietary | ❌ No (without legal review) |
 
-Run `go-licenses` to generate a license report:
+Run license checks with:
 
 ```bash
-go install github.com/google/go-licenses@latest
-go-licenses report ./... --template licenses.tpl
+pnpm add -D license-checker
+npx license-checker --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;CC0-1.0"
 ```
-
----
-
-## Go Toolchain
-
-Specify the minimum Go version in `go.mod`. Services should always target the **latest stable minor release** of Go.
-
-```go
-module github.com/rbkl/my-service
-
-go 1.22
-
-toolchain go1.22.5
-```
-
-The CI base image is updated within 30 days of each new Go minor release.
 
 ---
 

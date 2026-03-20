@@ -10,79 +10,78 @@
 - How this document is maintained
 
 ### 2. [Project Structure](docs/project-structure.md)
-- Repository layout
-- Monorepo vs. polyrepo strategy
-- Naming conventions (files, packages, variables)
+- Monorepo layout with `pnpm` workspaces
+- `apps/` vs. `packages/` conventions
+- Naming conventions (files, modules, variables)
 - Entry points and bootstrapping
 
 ### 3. [Web Servers & HTTP](docs/web-servers.md)
-- Approved framework: `net/http` + `chi` router
-- Middleware stack (CORS, request ID, timeout, recovery)
+- Approved framework: **Fastify** v4
+- Plugin architecture and middleware stack
 - Request/response lifecycle
 - Graceful shutdown
 - Health & readiness endpoints
 
 ### 4. [Logging](docs/logging.md)
-- Approved library: `slog` (structured logging)
+- Approved library: **Pino** (structured logging)
 - Log levels and when to use them
-- Correlation IDs and context propagation
+- Correlation IDs and async context propagation
 - Sensitive data redaction
-- Log output format (JSON in production, text in dev)
+- Log output format (JSON in production, pino-pretty in dev)
 
 ### 5. [Authentication & Authorization](docs/authentication.md)
 - Identity provider: OIDC / Entra ID (Azure AD)
-- JWT validation
+- JWT validation with `jose`
 - Role-based access control (RBAC)
-- Service-to-service auth (mTLS / workload identity)
+- Service-to-service auth (managed identity)
 - Forbidden patterns
 
 ### 6. [Database Access](docs/database.md)
-- Approved drivers: `pgx` (PostgreSQL), `database/sql` conventions
-- ORM policy: `sqlc` for query generation
-- Migrations: `golang-migrate`
-- Connection pooling and timeouts
+- Approved ORM: **Prisma** + PostgreSQL
+- Schema-first workflow
+- Migrations with `prisma migrate`
+- Connection pooling (PgBouncer / Prisma Accelerate)
 - Transaction handling
 
 ### 7. [Configuration Management](docs/configuration.md)
-- Approved library: `viper`
-- Environment variable conventions
+- Environment variables with `dotenv`
+- Schema validation with **Zod**
 - Secrets management (Azure Key Vault)
 - Config validation at startup
 - Feature flags
 
 ### 8. [Error Handling](docs/error-handling.md)
-- Sentinel errors and `errors.Is` / `errors.As`
-- Wrapping errors with context
+- Custom error classes
+- Fastify error hooks
 - HTTP error responses (RFC 7807 Problem Details)
-- Panic vs. error returns
+- Async/await error boundaries
 - Error logging rules
 
 ### 9. [Testing](docs/testing.md)
-- Standard library `testing` + `testify`
-- Unit, integration, and end-to-end test structure
-- Table-driven tests
+- **Vitest** for unit and integration tests
+- **React Testing Library** for component tests
+- **Supertest** for HTTP integration tests
 - Test coverage requirements (≥ 80%)
-- Mocking with `mockery`
-- Contract testing
+- Mocking with `vi.mock`
+- End-to-end testing with **Playwright**
 
 ### 10. [API Design](docs/api-design.md)
 - RESTful conventions
 - Versioning strategy (`/v1/`, `/v2/`)
-- OpenAPI 3.x specification requirements
+- OpenAPI 3.x specification with `fastify-swagger`
 - Pagination, filtering, sorting
 - Idempotency
 
 ### 11. [Security](docs/security.md)
 - Input validation and sanitization
-- Dependency scanning (`govulncheck`, Dependabot)
+- Dependency scanning (`npm audit`, Dependabot)
 - Secrets scanning (pre-commit hooks)
-- OWASP top-10 mitigations
-- Network policies and least privilege
+- OWASP top-10 mitigations (including frontend XSS, CSRF)
+- React-specific security (`DOMPurify`, CSP)
 
 ### 12. [Dependency Management](docs/dependency-management.md)
-- Go modules (`go.mod` / `go.sum`)
+- `pnpm` workspaces
 - Approved vs. restricted dependencies
-- Vendoring policy
 - Versioning and update cadence
 - License compliance
 
@@ -99,17 +98,21 @@
 
 | Concern | Approved Solution |
 |---|---|
-| Language | Go 1.22+ |
-| HTTP Router | `chi` v5 |
-| Structured Logging | `slog` (stdlib) |
-| Configuration | `viper` |
-| Database (SQL) | `pgx` v5 + `sqlc` |
-| Migrations | `golang-migrate` |
+| Backend Language | TypeScript (Node.js 20 LTS) |
+| Frontend Language | TypeScript + React 18 |
+| Package Manager | `pnpm` v9 |
+| HTTP Framework | Fastify v4 |
+| Frontend Build | Vite v5 |
+| Structured Logging | Pino v9 |
+| Configuration Validation | Zod v3 |
+| Database ORM | Prisma v5 (PostgreSQL) |
 | Identity | OIDC / Entra ID |
-| JWT | `golang-jwt/jwt` v5 |
-| Testing Assertions | `testify` |
-| Mocking | `mockery` v2 |
-| OpenAPI | `kin-openapi` / `oapi-codegen` |
+| JWT | `jose` v5 |
+| Unit/Integration Testing | Vitest v1 |
+| React Component Testing | React Testing Library |
+| E2E Testing | Playwright |
+| HTTP Integration Testing | Supertest |
+| OpenAPI | `@fastify/swagger` + `@fastify/swagger-ui` |
 | CI/CD | GitHub Actions |
 | Secrets | Azure Key Vault |
 

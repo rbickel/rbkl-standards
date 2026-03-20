@@ -4,56 +4,69 @@
 
 ## Approved Library
 
-RBKL uses **`log/slog`** (Go 1.21+ standard library) for all structured logging. No third-party logging library is permitted without a Platform Engineering approval.
+RBKL uses **Pino** for all structured logging in Node.js services. Pino is Fastify's built-in logger and is the fastest structured logger in the Node.js ecosystem.
 
-> **Why `slog`?** It is part of the Go standard library (no dependency), supports structured key-value attributes natively, is fast, and integrates with OpenTelemetry trace IDs.
+```bash
+pnpm add pino pino-pretty
+pnpm add -D @types/pino
+```
+
+> **Do not use** `console.log`, `winston`, or `morgan` in production services. Pino is the single approved logging solution.
 
 ---
 
-## Setup
+## Logger Initialization
 
-### Logger Initialization
+Create the logger once and export it. Pass it to services via dependency injection — do not import a global logger instance.
 
-Initialize the logger once in `main.go` and pass it through dependency injection. Do **not** use a global logger variable.
+```typescript
+// apps/api/src/lib/logger.ts
+import pino, { Logger, LoggerOptions } from "pino";
+import type { Config } from "../config/index.js";
 
-```go
-package main
+export function createLogger(config: Config): Logger {
+  const options: LoggerOptions = {
+    level: config.LOG_LEVEL, // "debug" | "info" | "warn" | "error"
+    base: {
+      service: config.SERVICE_NAME,
+      env: config.NODE_ENV,
+    },
+    // Redact sensitive fields from all log output
+    redact: {
+      paths: ["req.headers.authorization", "*.password", "*.token", "*.secret"],
+      censor: "[REDACTED]",
+    },
+    serializers: {
+      err: pino.stdSerializers.err,
+      error: pino.stdSerializers.err,
+    },
+    timestamp: pino.stdTimeFunctions.isoTime,
+  };
 
-import (
-    "log/slog"
-    "os"
+  if (config.NODE_ENV === "production") {
+    return pino(options);
+  }
 
-    "github.com/rbkl/my-service/internal/config"
-)
-
-func newLogger(cfg *config.Config) *slog.Logger {
-    var handler slog.Handler
-
-    opts := &slog.HandlerOptions{
-        Level:     cfg.LogLevel, // slog.LevelDebug, LevelInfo, LevelWarn, LevelError
-        AddSource: cfg.Env != "production",
-    }
-
-    if cfg.Env == "production" {
-        // JSON handler for production — consumed by log aggregators
-        handler = slog.NewJSONHandler(os.Stdout, opts)
-    } else {
-        // Text handler for local development — human-readable
-        handler = slog.NewTextHandler(os.Stdout, opts)
-    }
-
-    return slog.New(handler)
+  return pino({
+    ...options,
+    transport: {
+      target: "pino-pretty",
+      options: { colorize: true, translateTime: "SYS:standard" },
+    },
+  });
 }
+
+export type { Logger };
 ```
 
-### Default Log Levels by Environment
+Fastify uses the logger automatically when configured:
 
-| Environment | Minimum Level |
-|---|---|
-| `local` | `DEBUG` |
-| `dev` | `DEBUG` |
-| `staging` | `INFO` |
-| `production` | `INFO` |
+```typescript
+const server = Fastify({
+  logger: createLogger(config),
+  requestIdHeader: "x-request-id",
+});
+```
 
 ---
 
@@ -61,152 +74,102 @@ func newLogger(cfg *config.Config) *slog.Logger {
 
 | Level | When to Use | Example |
 |---|---|---|
-| `DEBUG` | Verbose diagnostic information useful only during development | Decoded request body, cache hit/miss, SQL query |
-| `INFO` | Normal operational events | Server started, request completed, user logged in |
-| `WARN` | Something unexpected but recoverable occurred | Retried a failing dependency, deprecated API called |
-| `ERROR` | An operation failed and requires attention | DB connection failed, unhandled error, data corruption |
+| `trace` | Extremely verbose — never in production | Function entry/exit |
+| `debug` | Diagnostic info useful during development | Request body, cache hit/miss, SQL query |
+| `info` | Normal operational events | Server started, request completed, user logged in |
+| `warn` | Something unexpected but recoverable | Retry attempted, deprecated endpoint called |
+| `error` | Operation failed and requires attention | DB connection failed, unhandled promise rejection |
+| `fatal` | Process cannot continue | Startup failure, catastrophic state |
 
-**Never use `ERROR` for client errors (4xx).** A missing resource or bad request is not a server error — log it at `INFO` or `DEBUG`.
+### Log Level per Environment
 
-```go
-// ✅ Client error — INFO
-logger.InfoContext(ctx, "user not found", "user_id", id)
+| Environment | Minimum Level |
+|---|---|
+| `local` | `debug` |
+| `dev` | `debug` |
+| `staging` | `info` |
+| `production` | `info` |
 
-// ✅ Server error — ERROR
-logger.ErrorContext(ctx, "database query failed", "error", err, "user_id", id)
-```
+**Never use `error` for 4xx HTTP responses.** A missing resource or invalid request is a client error — use `info` or `warn`.
 
 ---
 
-## Structured Attributes
+## Structured Logging
 
-Always use key-value pairs, never string concatenation.
+Always use key-value objects in log calls, never string concatenation.
 
-```go
+```typescript
 // ✅ Good — structured, parseable
-logger.InfoContext(ctx, "request completed",
-    "method", r.Method,
-    "path", r.URL.Path,
-    "status", status,
-    "duration_ms", duration.Milliseconds(),
-    "request_id", middleware.GetReqID(ctx),
-)
+request.log.info({
+  userId: user.id,
+  action: "user.created",
+  durationMs: Date.now() - start,
+});
 
-// ❌ Bad — unstructured
-logger.Info(fmt.Sprintf("request %s %s completed in %dms", r.Method, r.URL.Path, duration.Milliseconds()))
+// ❌ Bad — unstructured string
+logger.info(`User ${user.id} created in ${elapsed}ms`);
 ```
 
-### Standard Attribute Keys
+### Standard Field Names
 
-Use these keys consistently across all services so log aggregation queries work uniformly:
-
-| Key | Type | Description |
+| Field | Type | Description |
 |---|---|---|
-| `request_id` | string | Unique request identifier (from `X-Request-ID`) |
-| `trace_id` | string | OpenTelemetry trace ID |
-| `span_id` | string | OpenTelemetry span ID |
-| `user_id` | string | Authenticated user ID |
-| `service` | string | Service name (set at logger creation) |
+| `requestId` | string | Unique request ID (from `X-Request-ID`) |
+| `traceId` | string | OpenTelemetry trace ID |
+| `spanId` | string | OpenTelemetry span ID |
+| `userId` | string | Authenticated user ID |
+| `service` | string | Service name |
 | `env` | string | Deployment environment |
-| `error` | error | Go error value |
-| `duration_ms` | int64 | Duration in milliseconds |
+| `err` | Error | Error object (use `err`, not `error`) |
+| `durationMs` | number | Duration in milliseconds |
 | `method` | string | HTTP method |
-| `path` | string | HTTP path (no query string) |
-| `status` | int | HTTP response status code |
+| `url` | string | Request URL (no sensitive query params) |
+| `statusCode` | number | HTTP response status |
 
 ---
 
-## Context Propagation
+## Request Context
 
-Pass the logger through `context.Context` so it can carry correlation IDs automatically.
+In Fastify, each request has its own child logger (`request.log`) automatically created with the request ID. Always use `request.log` inside route handlers and hooks.
 
-```go
-// Inject logger with base attributes into context
-func WithLogger(ctx context.Context, logger *slog.Logger) context.Context {
-    return context.WithValue(ctx, loggerKey{}, logger)
+For services deeper in the call stack, inject the logger via constructor:
+
+```typescript
+// ✅ Good — logger injected into service
+class UserService {
+  constructor(
+    private readonly db: UserRepository,
+    private readonly log: Logger,
+  ) {}
+
+  async create(data: CreateUserDto): Promise<User> {
+    this.log.debug({ data }, "Creating user");
+    // ...
+  }
 }
 
-// Extract logger from context (falls back to default if not set)
-func FromContext(ctx context.Context) *slog.Logger {
-    if l, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok && l != nil {
-        return l
-    }
-    return slog.Default()
-}
-```
-
-In request middleware, inject the logger enriched with the request ID:
-
-```go
-func RequestLogger(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        reqID := middleware.GetReqID(r.Context())
-        logger := slog.Default().With(
-            "request_id", reqID,
-            "method", r.Method,
-            "path", r.URL.Path,
-        )
-        ctx := log.WithLogger(r.Context(), logger)
-        ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-        start := time.Now()
-
-        next.ServeHTTP(ww, r.WithContext(ctx))
-
-        logger.InfoContext(ctx, "request completed",
-            "status", ww.Status(),
-            "bytes", ww.BytesWritten(),
-            "duration_ms", time.Since(start).Milliseconds(),
-        )
-    })
-}
+// In route handler:
+const userService = new UserService(server.prisma, request.log);
 ```
 
 ---
 
 ## Sensitive Data Redaction
 
-**Never log the following data**, even at `DEBUG` level:
+Configure Pino's `redact` option at logger creation. The following paths **must always** be redacted:
 
-- Passwords, secrets, API keys, tokens
-- Full credit card numbers or PAN data
-- Social Security Numbers or national IDs
-- Private keys or certificates
-- Full OAuth `code` or `refresh_token` values
+- `req.headers.authorization`
+- `*.password`, `*.passwordHash`
+- `*.token`, `*.accessToken`, `*.refreshToken`
+- `*.secret`, `*.apiKey`, `*.privateKey`
+- `*.creditCard`, `*.ssn`
 
-Use a `Redacted` type to prevent accidental logging:
+```typescript
+// ❌ Do not pass sensitive values to logger even if redact is configured
+logger.info({ password: user.password });
 
-```go
-type Redacted string
-
-func (r Redacted) LogValue() slog.Value {
-    return slog.StringValue("[REDACTED]")
-}
-
-// Usage
-logger.Info("auth attempt", "username", username, "password", Redacted(password))
-// Output: auth attempt username=alice password=[REDACTED]
-```
-
----
-
-## OpenTelemetry Integration
-
-When tracing is enabled, enrich logs with trace and span IDs from the context:
-
-```go
-import "go.opentelemetry.io/otel/trace"
-
-func enrichWithTrace(ctx context.Context, logger *slog.Logger) *slog.Logger {
-    span := trace.SpanFromContext(ctx)
-    if !span.IsRecording() {
-        return logger
-    }
-    sc := span.SpanContext()
-    return logger.With(
-        "trace_id", sc.TraceID().String(),
-        "span_id", sc.SpanID().String(),
-    )
-}
+// ✅ Log only non-sensitive identifiers
+logger.info({ userId: user.id, email: user.email });
 ```
 
 ---
@@ -214,48 +177,57 @@ func enrichWithTrace(ctx context.Context, logger *slog.Logger) *slog.Logger {
 ## Log Output Format
 
 ### Production (JSON)
+
 ```json
 {
+  "level": "info",
   "time": "2026-03-20T12:34:56.789Z",
-  "level": "INFO",
-  "msg": "request completed",
   "service": "user-service",
   "env": "production",
-  "request_id": "abc-123",
-  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "span_id": "00f067aa0ba902b7",
-  "user_id": "usr_01HX...",
+  "requestId": "abc-123",
+  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "userId": "usr_01HX",
+  "msg": "request completed",
   "method": "GET",
-  "path": "/v1/users/usr_01HX",
-  "status": 200,
-  "duration_ms": 42
+  "url": "/v1/users/usr_01HX",
+  "statusCode": 200,
+  "durationMs": 42
 }
 ```
 
-### Development (Text)
+### Development (pino-pretty)
+
 ```
-time=2026-03-20T12:34:56.789Z level=INFO msg="request completed" service=user-service request_id=abc-123 method=GET path=/v1/users/usr_01HX status=200 duration_ms=42
+[12:34:56.789] INFO (user-service): request completed
+    requestId: "abc-123"
+    method: "GET"
+    url: "/v1/users/usr_01HX"
+    statusCode: 200
+    durationMs: 42
 ```
 
 ---
 
 ## Prohibited Patterns
 
-```go
-// ❌ Never use fmt.Println or fmt.Printf for logging
-fmt.Println("something happened")
+```typescript
+// ❌ Never use console.log/warn/error in service code
+console.log("something happened");
+console.error(err);
 
-// ❌ Never use the `log` package (log.Print, log.Fatal, etc.)
-log.Printf("error: %v", err)
+// ❌ Never log string interpolations
+logger.info(`User ${id} failed to load`);
 
-// ❌ Never use log.Fatal outside of main()
-log.Fatal("startup failed")    // kills the process without cleanup
+// ❌ Never swallow errors without logging
+try {
+  await doSomething();
+} catch {
+  // Silent catch
+}
 
-// ❌ Never swallow errors silently
-if err != nil { return } // Where is the log?
-
-// ❌ Never use string formatting for attributes
-logger.Info(fmt.Sprintf("user %s logged in", userID))
+// ❌ Never use the root logger in request handlers — use request.log
+import { logger } from "../lib/logger.js";
+logger.info("handler called"); // Loses request context
 ```
 
 ---

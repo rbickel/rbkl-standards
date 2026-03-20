@@ -7,11 +7,11 @@
 RBKL uses **Azure Active Directory (Entra ID)** as the single identity provider. All authentication flows use the **OpenID Connect (OIDC)** protocol. Services validate **JWT access tokens** signed by Entra ID.
 
 ```
-Client → Azure AD (OIDC) → JWT access token → RBKL Service
-                                                     ↓
-                                             Validate JWT signature
-                                             Validate claims (iss, aud, exp)
-                                             Extract roles → enforce RBAC
+Browser/Client → Azure AD (OIDC) → JWT access token → RBKL API
+                                                           ↓
+                                                   Validate JWT (jose)
+                                                   Validate claims (iss, aud, exp)
+                                                   Extract roles → enforce RBAC
 ```
 
 ---
@@ -20,12 +20,11 @@ Client → Azure AD (OIDC) → JWT access token → RBKL Service
 
 | Library | Purpose | Version |
 |---|---|---|
-| `golang-jwt/jwt/v5` | JWT parsing and validation | v5 |
-| `MicahParks/keyfunc` | JWKS key set fetching and caching | v3 |
+| `jose` | JWT parsing, JWKS fetching, OIDC discovery | v5 |
+| `@fastify/jwt` | Fastify JWT plugin (wraps jose) | latest |
 
 ```bash
-go get github.com/golang-jwt/jwt/v5
-go get github.com/MicahParks/keyfunc/v3
+pnpm add jose @fastify/jwt
 ```
 
 ---
@@ -40,127 +39,87 @@ Every service **must** validate these claims on every authenticated request:
 |---|---|
 | `iss` (issuer) | Must equal `https://login.microsoftonline.com/{tenantID}/v2.0` |
 | `aud` (audience) | Must equal the service's own Application (client) ID |
-| `exp` (expiry) | Must be in the future (automatically checked by `golang-jwt`) |
-| `nbf` (not before) | Must be in the past (automatically checked by `golang-jwt`) |
+| `exp` (expiry) | Must be in the future |
+| `nbf` (not before) | Must be in the past |
 | `tid` (tenant ID) | Must match the expected Azure AD tenant |
 
-### Implementation
+### Auth Plugin Implementation
 
-```go
-package auth
+```typescript
+// apps/api/src/plugins/auth.ts
+import fp from "fastify-plugin";
+import { FastifyPluginAsync, FastifyRequest, FastifyReply } from "fastify";
+import { createRemoteJWKSet, jwtVerify, JWTPayload } from "jose";
+import type { Config } from "../config/index.js";
 
-import (
-    "context"
-    "fmt"
-    "net/http"
-    "strings"
-    "time"
-
-    "github.com/MicahParks/keyfunc/v3"
-    "github.com/golang-jwt/jwt/v5"
-)
-
-type Claims struct {
-    jwt.RegisteredClaims
-    TenantID string   `json:"tid"`
-    Roles    []string `json:"roles"`
-    Name     string   `json:"name"`
-    Email    string   `json:"preferred_username"`
-    ObjectID string   `json:"oid"`
+export interface JwtClaims extends JWTPayload {
+  tid: string;            // Tenant ID
+  oid: string;            // Object ID (user's unique ID in the tenant)
+  roles?: string[];       // App roles assigned to the user
+  name?: string;
+  preferred_username?: string;
 }
 
-type Validator struct {
-    jwks      keyfunc.Keyfunc
-    issuer    string
-    audience  string
-    tenantID  string
+declare module "fastify" {
+  interface FastifyInstance {
+    authenticate: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
+  }
+  interface FastifyRequest {
+    jwtClaims: JwtClaims;
+  }
 }
 
-func NewValidator(ctx context.Context, cfg *Config) (*Validator, error) {
-    // Automatically fetches and caches the JWKS from Azure AD.
-    // Keys are refreshed in the background before expiry.
-    jwks, err := keyfunc.NewDefaultCtx(ctx, []string{
-        fmt.Sprintf("https://login.microsoftonline.com/%s/discovery/v2.0/keys", cfg.TenantID),
-    })
-    if err != nil {
-        return nil, fmt.Errorf("failed to fetch JWKS: %w", err)
-    }
-
-    return &Validator{
-        jwks:     jwks,
-        issuer:   fmt.Sprintf("https://login.microsoftonline.com/%s/v2.0", cfg.TenantID),
-        audience: cfg.ClientID,
-        tenantID: cfg.TenantID,
-    }, nil
+interface AuthPluginOptions {
+  config: Config;
 }
 
-func (v *Validator) ValidateToken(tokenString string) (*Claims, error) {
-    var claims Claims
+const authPlugin: FastifyPluginAsync<AuthPluginOptions> = fp(
+  async (server, { config }) => {
+    const JWKS = createRemoteJWKSet(
+      new URL(
+        `https://login.microsoftonline.com/${config.AZURE_TENANT_ID}/discovery/v2.0/keys`,
+      ),
+      { cooldownDuration: 300_000 }, // Refresh keys at most every 5 minutes
+    );
 
-    _, err := jwt.ParseWithClaims(tokenString, &claims,
-        v.jwks.Keyfunc,
-        jwt.WithIssuer(v.issuer),
-        jwt.WithAudience(v.audience),
-        jwt.WithExpirationRequired(),
-        jwt.WithLeeway(30*time.Second),
-    )
-    if err != nil {
-        return nil, fmt.Errorf("invalid token: %w", err)
-    }
+    const expectedIssuer = `https://login.microsoftonline.com/${config.AZURE_TENANT_ID}/v2.0`;
 
-    if claims.TenantID != v.tenantID {
-        return nil, fmt.Errorf("invalid tenant ID in token")
-    }
+    server.decorate(
+      "authenticate",
+      async (request: FastifyRequest, reply: FastifyReply) => {
+        const authHeader = request.headers.authorization;
+        if (!authHeader?.startsWith("Bearer ")) {
+          return reply
+            .status(401)
+            .send({ title: "Unauthorized", status: 401 });
+        }
 
-    return &claims, nil
-}
-```
+        const token = authHeader.slice(7);
+        try {
+          const { payload } = await jwtVerify<JwtClaims>(token, JWKS, {
+            issuer: expectedIssuer,
+            audience: config.AZURE_CLIENT_ID,
+            clockTolerance: 30, // seconds
+          });
 
-### Authentication Middleware
+          if (payload.tid !== config.AZURE_TENANT_ID) {
+            throw new Error("Invalid tenant ID");
+          }
 
-```go
-package middleware
+          request.jwtClaims = payload;
+        } catch (err) {
+          // Log at info — this is a client error
+          request.log.info({ err }, "Authentication failed");
+          return reply
+            .status(401)
+            .send({ title: "Unauthorized", status: 401 });
+        }
+      },
+    );
+  },
+);
 
-import (
-    "net/http"
-    "strings"
-
-    "github.com/rbkl/my-service/internal/auth"
-)
-
-type contextKey string
-
-const ClaimsKey contextKey = "claims"
-
-func Authenticate(validator *auth.Validator) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            authHeader := r.Header.Get("Authorization")
-            if !strings.HasPrefix(authHeader, "Bearer ") {
-                http.Error(w, `{"title":"Unauthorized","status":401}`, http.StatusUnauthorized)
-                return
-            }
-
-            token := strings.TrimPrefix(authHeader, "Bearer ")
-            claims, err := validator.ValidateToken(token)
-            if err != nil {
-                // Log at INFO — this is a client error, not a server error
-                log.FromContext(r.Context()).Info("authentication failed", "error", err)
-                http.Error(w, `{"title":"Unauthorized","status":401}`, http.StatusUnauthorized)
-                return
-            }
-
-            ctx := context.WithValue(r.Context(), ClaimsKey, claims)
-            next.ServeHTTP(w, r.WithContext(ctx))
-        })
-    }
-}
-
-// ClaimsFromContext retrieves the validated JWT claims from the request context.
-func ClaimsFromContext(ctx context.Context) (*auth.Claims, bool) {
-    claims, ok := ctx.Value(ClaimsKey).(*auth.Claims)
-    return claims, ok
-}
+export { authPlugin };
 ```
 
 ---
@@ -169,9 +128,9 @@ func ClaimsFromContext(ctx context.Context) (*auth.Claims, bool) {
 
 ### Role Definition
 
-Roles are defined in Azure AD as **App Roles** on the service's App Registration and assigned to users or groups. They appear in the JWT `roles` claim.
+Roles are defined in Azure AD as **App Roles** on the service's App Registration. They appear in the JWT `roles` claim.
 
-**Naming convention:** `{service}.{resource}.{action}` in `PascalCase`
+**Naming convention:** `{Service}.{Resource}.{Action}` in `PascalCase`
 
 ```
 UserService.Users.Read
@@ -179,108 +138,166 @@ UserService.Users.Write
 UserService.Users.Admin
 ```
 
-### RBAC Middleware
+### RBAC Helper
 
-```go
-func RequireRole(roles ...string) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            claims, ok := ClaimsFromContext(r.Context())
-            if !ok {
-                http.Error(w, `{"title":"Forbidden","status":403}`, http.StatusForbidden)
-                return
-            }
+```typescript
+// apps/api/src/plugins/auth.ts (extend the plugin)
+export function requireRole(...roles: string[]) {
+  return async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
+    const userRoles = request.jwtClaims?.roles ?? [];
+    const hasRole = roles.some((role) => userRoles.includes(role));
 
-            for _, required := range roles {
-                for _, assigned := range claims.Roles {
-                    if assigned == required {
-                        next.ServeHTTP(w, r)
-                        return
-                    }
-                }
-            }
-
-            http.Error(w, `{"title":"Forbidden","status":403}`, http.StatusForbidden)
-        })
+    if (!hasRole) {
+      return reply.status(403).send({ title: "Forbidden", status: 403 });
     }
+  };
 }
 ```
 
-### Usage in Router
+### Usage in Routes
 
-```go
-r.Route("/v1/users", func(r chi.Router) {
-    r.Use(middleware.Authenticate(validator))
-    
-    // Any authenticated user can list users
-    r.Get("/", h.ListUsers)
-    
-    // Only users with Write role can create
-    r.With(middleware.RequireRole("UserService.Users.Write")).Post("/", h.CreateUser)
-    
-    // Only admins can delete
-    r.With(middleware.RequireRole("UserService.Users.Admin")).Delete("/{id}", h.DeleteUser)
-})
+```typescript
+// apps/api/src/routes/users.ts
+server.get("/", {
+  onRequest: [server.authenticate],
+}, listUsersHandler);
+
+server.post("/", {
+  onRequest: [server.authenticate, requireRole("UserService.Users.Write")],
+}, createUserHandler);
+
+server.delete("/:id", {
+  onRequest: [server.authenticate, requireRole("UserService.Users.Admin")],
+}, deleteUserHandler);
+```
+
+---
+
+## Frontend Authentication (React)
+
+Use the **MSAL React** library to handle authentication in React applications.
+
+```bash
+pnpm add @azure/msal-browser @azure/msal-react
+```
+
+### MSAL Configuration
+
+```typescript
+// apps/web/src/lib/auth/msal-config.ts
+import { Configuration, PublicClientApplication } from "@azure/msal-browser";
+
+const msalConfig: Configuration = {
+  auth: {
+    clientId: import.meta.env.VITE_AZURE_CLIENT_ID,
+    authority: `https://login.microsoftonline.com/${import.meta.env.VITE_AZURE_TENANT_ID}`,
+    redirectUri: window.location.origin,
+  },
+  cache: {
+    cacheLocation: "sessionStorage", // Do not use localStorage for tokens
+    storeAuthStateInCookie: false,
+  },
+};
+
+export const msalInstance = new PublicClientApplication(msalConfig);
+```
+
+### Auth Provider Setup
+
+```tsx
+// apps/web/src/main.tsx
+import { MsalProvider } from "@azure/msal-react";
+import { msalInstance } from "./lib/auth/msal-config.js";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  <MsalProvider instance={msalInstance}>
+    <App />
+  </MsalProvider>,
+);
+```
+
+### Protected Routes
+
+```tsx
+// apps/web/src/components/ProtectedRoute.tsx
+import { useIsAuthenticated, useMsal } from "@azure/msal-react";
+import { Navigate } from "react-router-dom";
+
+export function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const isAuthenticated = useIsAuthenticated();
+  const { inProgress } = useMsal();
+
+  if (inProgress !== "none") return <LoadingSpinner />;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+
+  return <>{children}</>;
+}
+```
+
+### Acquiring Tokens for API Calls
+
+```typescript
+// apps/web/src/lib/api/client.ts
+import { msalInstance } from "../auth/msal-config.js";
+
+export async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+  const account = msalInstance.getActiveAccount();
+  if (!account) throw new Error("No active account");
+
+  const tokenResponse = await msalInstance.acquireTokenSilent({
+    account,
+    scopes: [`api://${import.meta.env.VITE_API_CLIENT_ID}/.default`],
+  });
+
+  return fetch(url, {
+    ...init,
+    headers: {
+      ...init?.headers,
+      Authorization: `Bearer ${tokenResponse.accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+}
 ```
 
 ---
 
 ## Service-to-Service Authentication
 
-For internal service-to-service communication, use **Azure Managed Identity** and **workload identity federation** — never shared secrets or static API keys.
+For internal service-to-service calls, use **Azure Managed Identity** — never static API keys or secrets.
 
-### Pattern: Acquire Token with Managed Identity
+```typescript
+import { DefaultAzureCredential } from "@azure/identity";
 
-```go
-import "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+const credential = new DefaultAzureCredential();
 
-func newCredential() (azcore.TokenCredential, error) {
-    // In production: uses the pod/VM managed identity automatically
-    // Locally: falls back to az CLI credentials
-    return azidentity.NewDefaultAzureCredential(nil)
+async function getServiceToken(targetClientId: string): Promise<string> {
+  const tokenResponse = await credential.getToken(
+    `api://${targetClientId}/.default`,
+  );
+  return tokenResponse.token;
 }
 ```
-
-The consuming service acquires a token for the target service's `clientID` and sends it as a `Bearer` token. The target service validates it the same way as user tokens.
 
 ---
 
 ## Forbidden Patterns
 
-The following patterns are **never** acceptable:
+```typescript
+// ❌ Skip validation in any environment
+if (process.env.NODE_ENV === "development") return next(); // Never bypass auth
 
-```go
-// ❌ Skip token validation — even in dev/staging environments
-if cfg.Env == "dev" { next.ServeHTTP(w, r); return }
+// ❌ Static API keys in code or config files
+const apiKey = "sk-hardcoded-secret-abc123";
 
-// ❌ Static API keys stored in code or config files
-apiKey := "sk-hardcoded-secret-abc123"
+// ❌ Trust client-supplied identity headers
+const userId = req.headers["x-user-id"]; // Anyone can set this
 
-// ❌ Basic authentication (username + password over HTTP)
-r.Header.Set("Authorization", "Basic "+base64Encode(user+":"+pass))
-
-// ❌ Trust user-supplied claims without validation
-userID := r.Header.Get("X-User-ID") // Anyone can set this header
+// ❌ Store tokens in localStorage (XSS risk)
+localStorage.setItem("access_token", token);
 
 // ❌ Disable TLS certificate verification
-http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-```
-
----
-
-## Local Development
-
-For local development, use a test Azure AD application registration or the [Azure AD Local Emulator](https://learn.microsoft.com/en-us/azure/active-directory/develop/). Never disable auth locally — generate real short-lived tokens.
-
-A helper script `scripts/get-dev-token.sh` should be provided in every service to acquire a development token:
-
-```bash
-#!/usr/bin/env bash
-# Acquire a dev token using az CLI
-az account get-access-token \
-  --resource "$CLIENT_ID" \
-  --query accessToken \
-  --output tsv
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 ```
 
 ---

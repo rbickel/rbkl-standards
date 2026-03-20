@@ -2,143 +2,86 @@
 
 ← [Back to README](../README.md)
 
-## Approved Library
+## Approach
 
-RBKL uses **`viper`** for all configuration management.
+RBKL uses **environment variables** as the configuration source, validated with **Zod** at startup. `dotenv` loads variables from `.env` files in non-production environments.
 
 ```bash
-go get github.com/spf13/viper
+pnpm add zod dotenv
 ```
-
-Viper provides a unified interface over environment variables, config files, and remote configuration stores (Azure App Configuration).
 
 ---
 
 ## Configuration Sources (Priority Order)
 
-Viper reads configuration from these sources, in descending priority:
-
 1. **Environment variables** — Highest priority. Used in all deployed environments.
-2. **`.env` file** — For local development only. Never committed to git (add to `.gitignore`).
-3. **`config.yaml` file** — Non-sensitive default values. Safe to commit.
-4. **Default values** — Set in code via `viper.SetDefault()`.
+2. **`.env.local`** — Developer-specific overrides. Never committed to git.
+3. **`.env`** — Shared non-sensitive defaults for local development. Safe to commit.
+4. **`.env.test`** — Test-specific values loaded by Vitest. Committed to git (no secrets).
 
 ---
 
-## Config Struct Pattern
+## Config Schema with Zod
 
-Define a strongly-typed config struct. Viper unmarshals into it at startup.
+Define a Zod schema that parses and validates `process.env` at application startup. The application **must fail fast** with a clear error if any required variable is missing or invalid.
 
-```go
-package config
+```typescript
+// apps/api/src/config/index.ts
+import { z } from "zod";
+import { config as loadDotenv } from "dotenv";
 
-import (
-    "fmt"
-    "log/slog"
-    "strings"
-    "time"
-
-    "github.com/spf13/viper"
-)
-
-type Config struct {
-    // Server
-    Port int    `mapstructure:"PORT"`
-    Env  string `mapstructure:"ENV"` // local | dev | staging | production
-
-    // Database
-    DatabaseURL             string        `mapstructure:"DATABASE_URL"`
-    DatabaseMaxConns        int32         `mapstructure:"DATABASE_MAX_CONNS"`
-    DatabaseMaxConnLifetime time.Duration `mapstructure:"DATABASE_MAX_CONN_LIFETIME"`
-
-    // Auth
-    AzureTenantID string `mapstructure:"AZURE_TENANT_ID"`
-    AzureClientID string `mapstructure:"AZURE_CLIENT_ID"`
-
-    // CORS
-    AllowedOrigins []string `mapstructure:"ALLOWED_ORIGINS"`
-
-    // Logging
-    LogLevel slog.Level `mapstructure:"LOG_LEVEL"`
+// Load .env files in non-production environments
+if (process.env.NODE_ENV !== "production") {
+  loadDotenv({ path: ".env.local", override: true });
+  loadDotenv({ path: ".env" });
 }
 
-func Load() (*Config, error) {
-    v := viper.New()
+const ConfigSchema = z.object({
+  // Server
+  NODE_ENV: z.enum(["local", "development", "test", "staging", "production"]).default("local"),
+  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),
+  SERVICE_NAME: z.string().min(1),
 
-    // ── Defaults ──────────────────────────────────────────────────────────────
-    v.SetDefault("PORT", 8080)
-    v.SetDefault("ENV", "local")
-    v.SetDefault("LOG_LEVEL", "INFO")
-    v.SetDefault("DATABASE_MAX_CONNS", 10)
-    v.SetDefault("DATABASE_MAX_CONN_LIFETIME", "1h")
-    v.SetDefault("ALLOWED_ORIGINS", []string{"http://localhost:3000"})
+  // CORS
+  ALLOWED_ORIGINS: z
+    .string()
+    .transform((val) => val.split(",").map((s) => s.trim()))
+    .default("http://localhost:5173"),
 
-    // ── Config file (optional) ────────────────────────────────────────────────
-    v.SetConfigName("config")
-    v.SetConfigType("yaml")
-    v.AddConfigPath(".")
-    v.AddConfigPath("./config")
-    if err := v.ReadInConfig(); err != nil {
-        if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-            return nil, fmt.Errorf("read config file: %w", err)
-        }
-    }
+  // Azure AD
+  AZURE_TENANT_ID: z.string().uuid(),
+  AZURE_CLIENT_ID: z.string().uuid(),
 
-    // ── .env file (local dev only) ────────────────────────────────────────────
-    v.SetConfigFile(".env")
-    _ = v.MergeInConfig() // Ignore error if .env doesn't exist
+  // Database
+  DATABASE_URL: z.string().url(),
 
-    // ── Environment variables ─────────────────────────────────────────────────
-    v.AutomaticEnv()
-    v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+  // Optional features
+  FEATURE_NEW_DASHBOARD: z.coerce.boolean().default(false),
+});
 
-    // ── Unmarshal into struct ─────────────────────────────────────────────────
-    var cfg Config
-    if err := v.Unmarshal(&cfg); err != nil {
-        return nil, fmt.Errorf("unmarshal config: %w", err)
-    }
+export type Config = z.infer<typeof ConfigSchema>;
 
-    if err := cfg.validate(); err != nil {
-        return nil, fmt.Errorf("invalid config: %w", err)
-    }
+export function loadConfig(): Config {
+  const result = ConfigSchema.safeParse(process.env);
 
-    return &cfg, nil
+  if (!result.success) {
+    const formatted = result.error.format();
+    console.error("❌ Invalid configuration:");
+    console.error(JSON.stringify(formatted, null, 2));
+    process.exit(1);
+  }
+
+  return result.data;
 }
 ```
 
----
+### Key Features
 
-## Config Validation
-
-Validate all required fields at startup. The application must fail fast with a clear error message rather than crashing later with a cryptic nil pointer dereference.
-
-```go
-func (c *Config) validate() error {
-    var errs []string
-
-    if c.DatabaseURL == "" {
-        errs = append(errs, "DATABASE_URL is required")
-    }
-    if c.AzureTenantID == "" {
-        errs = append(errs, "AZURE_TENANT_ID is required")
-    }
-    if c.AzureClientID == "" {
-        errs = append(errs, "AZURE_CLIENT_ID is required")
-    }
-    if c.Port < 1 || c.Port > 65535 {
-        errs = append(errs, "PORT must be between 1 and 65535")
-    }
-    validEnvs := map[string]bool{"local": true, "dev": true, "staging": true, "production": true}
-    if !validEnvs[c.Env] {
-        errs = append(errs, fmt.Sprintf("ENV must be one of: local, dev, staging, production (got %q)", c.Env))
-    }
-
-    if len(errs) > 0 {
-        return fmt.Errorf("configuration errors:\n  - %s", strings.Join(errs, "\n  - "))
-    }
-    return nil
-}
-```
+- `z.coerce.number()` / `z.coerce.boolean()` — automatically coerces string env vars to the correct type.
+- `.transform()` — converts comma-separated strings to arrays.
+- `.default()` — provides fallback values without requiring the variable to be set.
+- `safeParse` + descriptive error + `process.exit(1)` — clear failure message at startup.
 
 ---
 
@@ -147,21 +90,50 @@ func (c *Config) validate() error {
 | Convention | Example |
 |---|---|
 | All uppercase, underscore-separated | `DATABASE_URL`, `AZURE_CLIENT_ID` |
-| Prefix with service name in multi-service environments | `USERS_DATABASE_URL` |
-| Duration values use Go duration format | `REQUEST_TIMEOUT=30s` |
-| Boolean values: `true` / `false` | `FEATURE_NEW_DASHBOARD=true` |
-| List values: comma-separated | `ALLOWED_ORIGINS=https://app.rbkl.com,https://admin.rbkl.com` |
+| Prefix service name in multi-service environments | `USERS_DATABASE_URL` |
+| Booleans: `true` / `false` | `FEATURE_NEW_DASHBOARD=true` |
+| Lists: comma-separated | `ALLOWED_ORIGINS=https://app.rbkl.com,https://admin.rbkl.com` |
+| Durations: milliseconds (integers) | `REQUEST_TIMEOUT_MS=30000` |
+
+---
+
+## Frontend Configuration (Vite)
+
+Vite exposes environment variables prefixed with `VITE_` to the browser bundle. All others are server-side only.
+
+```typescript
+// apps/web/src/lib/config.ts
+import { z } from "zod";
+
+const EnvSchema = z.object({
+  VITE_API_BASE_URL: z.string().url(),
+  VITE_AZURE_TENANT_ID: z.string().uuid(),
+  VITE_AZURE_CLIENT_ID: z.string().uuid(),
+  VITE_API_CLIENT_ID: z.string().uuid(),
+});
+
+// import.meta.env is the Vite equivalent of process.env
+const parsed = EnvSchema.safeParse(import.meta.env);
+if (!parsed.success) {
+  throw new Error(`Invalid frontend config: ${parsed.error.message}`);
+}
+
+export const env = parsed.data;
+```
+
+**Never prefix a secret with `VITE_`** — anything prefixed `VITE_` is embedded in the JavaScript bundle and visible to all users.
 
 ---
 
 ## Secrets Management
 
-**Rule: No secrets in config files, environment variable files (`.env`), or source code.** Secrets are stored in **Azure Key Vault** and injected at runtime.
+**Rule: No secrets in config files, `.env` files (other than `.env.local`), or source code.** Secrets are stored in **Azure Key Vault** and injected at runtime.
 
 ### Options for Secret Injection
 
 #### Option A: CSI Secret Store Driver (Kubernetes)
-The recommended approach for Kubernetes deployments. Secrets are mounted as files or environment variables by the CSI driver. No application-level Azure SDK required.
+
+Recommended for Kubernetes. Secrets are mounted as environment variables by the CSI driver. No application-level Azure SDK required.
 
 ```yaml
 # kubernetes/deployment.yaml
@@ -173,99 +145,69 @@ env:
         key: database-url
 ```
 
-#### Option B: Managed Identity + Azure SDK (non-Kubernetes)
-For Azure App Service or Azure Functions:
+#### Option B: Azure SDK (non-Kubernetes)
 
-```go
-import (
-    "github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-    "github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets"
-)
+For Azure App Service or Azure Container Apps:
 
-func loadSecret(ctx context.Context, vaultURL, secretName string) (string, error) {
-    cred, err := azidentity.NewDefaultAzureCredential(nil)
-    if err != nil {
-        return "", fmt.Errorf("get credential: %w", err)
-    }
+```typescript
+import { DefaultAzureCredential } from "@azure/identity";
+import { SecretClient } from "@azure/keyvault-secrets";
 
-    client, err := azsecrets.NewClient(vaultURL, cred, nil)
-    if err != nil {
-        return "", fmt.Errorf("create secrets client: %w", err)
-    }
+async function loadSecrets(vaultUrl: string): Promise<void> {
+  const credential = new DefaultAzureCredential();
+  const client = new SecretClient(vaultUrl, credential);
 
-    resp, err := client.GetSecret(ctx, secretName, "", nil)
-    if err != nil {
-        return "", fmt.Errorf("get secret %q: %w", secretName, err)
-    }
-
-    return *resp.Value, nil
-}
-```
-
----
-
-## Feature Flags
-
-For runtime feature toggles, use Azure App Configuration with feature flag support. Do not use environment variables for feature flags that need to be toggled without redeployment.
-
-```go
-// Simple boolean feature flag check
-func (c *Config) IsEnabled(feature string) bool {
-    return viper.GetBool("feature." + feature)
+  const dbUrl = await client.getSecret("database-url");
+  process.env.DATABASE_URL = dbUrl.value!;
 }
 
-// Usage
-if cfg.IsEnabled("new_dashboard") {
-    handler.ServeNewDashboard(w, r)
-} else {
-    handler.ServeLegacyDashboard(w, r)
-}
+// Call before loadConfig()
+await loadSecrets(process.env.KEY_VAULT_URL!);
 ```
 
 ---
 
 ## `.env.example` File
 
-Every repository **must** include a `.env.example` file with all required variables documented (but no real values). This file **is** committed to git.
+Every repository **must** include a `.env.example` file with all required variables (no real values). This file **is** committed to git.
 
 ```dotenv
 # Server
-PORT=8080
-ENV=local
+NODE_ENV=local
+PORT=3000
+LOG_LEVEL=debug
+SERVICE_NAME=user-service
 
-# Database
-DATABASE_URL=postgres://user:password@localhost:5432/mydb?sslmode=disable
-DATABASE_MAX_CONNS=10
+# CORS
+ALLOWED_ORIGINS=http://localhost:5173
 
 # Azure AD
 AZURE_TENANT_ID=your-tenant-id-here
 AZURE_CLIENT_ID=your-client-id-here
 
-# CORS
-ALLOWED_ORIGINS=http://localhost:3000
+# Database
+DATABASE_URL=******localhost:5432/mydb
 
-# Logging
-LOG_LEVEL=DEBUG
+# Feature flags
+FEATURE_NEW_DASHBOARD=false
 ```
 
 ---
 
 ## Prohibited Patterns
 
-```go
+```typescript
 // ❌ Hardcoded secrets
-const dbPassword = "super-secret-password"
+const dbPassword = "super-secret-password";
 
-// ❌ Reading secrets from files in production
-ioutil.ReadFile("/etc/secrets/db-password")
+// ❌ Accessing process.env directly in business logic
+const tenantId = process.env.AZURE_TENANT_ID; // Use injected config instead
 
-// ❌ Environment variables directly (bypass viper)
-os.Getenv("DATABASE_URL") // Use cfg.DatabaseURL instead
+// ❌ No validation — runtime crash with unhelpful message
+const port = parseInt(process.env.PORT!); // What if PORT is "abc"?
 
-// ❌ Config struct with no validation
-func Load() Config {
-    return Config{Port: viper.GetInt("PORT")} // No validation!
-}
+// ❌ Committing .env files with real values
+git add .env // Should be in .gitignore
 ```
 
 ---

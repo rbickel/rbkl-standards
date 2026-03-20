@@ -10,101 +10,155 @@ Security is built into every layer. RBKL adopts a **defense-in-depth** strategy:
 
 ## Input Validation
 
-All external input must be validated before use. Validation happens at the handler layer before data reaches the service layer.
+All external input is validated with **Zod** (backend) or **Fastify JSON Schema** (HTTP layer) before use.
 
-### Approved Validation Library
+### Backend (Fastify + TypeBox)
 
-Use `go-playground/validator` for struct-level validation:
+```typescript
+import { Type, Static } from "@sinclair/typebox";
+
+const CreateUserBody = Type.Object({
+  email: Type.String({ format: "email", maxLength: 254 }),
+  name: Type.String({ minLength: 2, maxLength: 100 }),
+  role: Type.Union([
+    Type.Literal("admin"),
+    Type.Literal("editor"),
+    Type.Literal("viewer"),
+  ]),
+});
+
+// Fastify validates this schema BEFORE the handler runs
+server.post("/", { schema: { body: CreateUserBody } }, handler);
+```
+
+### Frontend (React + Zod)
+
+Validate form data with `react-hook-form` + Zod resolver:
+
+```tsx
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+
+const CreateUserSchema = z.object({
+  email: z.string().email("Must be a valid email"),
+  name: z.string().min(2, "At least 2 characters").max(100),
+});
+
+type FormData = z.infer<typeof CreateUserSchema>;
+
+function CreateUserForm() {
+  const { register, handleSubmit, formState: { errors } } = useForm<FormData>({
+    resolver: zodResolver(CreateUserSchema),
+  });
+  // ...
+}
+```
+
+---
+
+## React-Specific Security
+
+### XSS Prevention
+
+React escapes values by default in JSX. **Never bypass this protection**:
+
+```tsx
+// ✅ Safe — React escapes this
+<div>{userSuppliedContent}</div>
+
+// ❌ Dangerous — bypasses React's escaping
+<div dangerouslySetInnerHTML={{ __html: userSuppliedContent }} />
+```
+
+If rendering HTML from a trusted source is absolutely required, sanitize it with **DOMPurify**:
+
+```tsx
+import DOMPurify from "dompurify";
+
+<div dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(trustedHtml) }} />
+```
+
+### Content Security Policy (CSP)
+
+Set a strict CSP header on all HTML responses from the backend serving the React app:
+
+```typescript
+server.addHook("onSend", async (request, reply, payload) => {
+  if (reply.getHeader("content-type")?.toString().includes("text/html")) {
+    reply.header(
+      "Content-Security-Policy",
+      [
+        "default-src 'self'",
+        "script-src 'self'",        // No 'unsafe-inline', no CDN scripts
+        "style-src 'self' 'unsafe-inline'",  // Inline styles needed for CSS-in-JS
+        "img-src 'self' data: https://cdn.rbkl.com",
+        "connect-src 'self' https://api.rbkl.com https://login.microsoftonline.com",
+        "frame-ancestors 'none'",
+      ].join("; "),
+    );
+  }
+});
+```
+
+### Secure Cookie Handling
+
+```typescript
+// ✅ Secure cookie flags (if using cookies for session state)
+reply.setCookie("session", value, {
+  httpOnly: true,    // Not accessible via JavaScript
+  secure: true,      // HTTPS only
+  sameSite: "strict",
+  maxAge: 3600,
+  path: "/",
+});
+```
+
+---
+
+## HTTP Security Headers
+
+Apply these headers to all responses via a Fastify plugin:
+
+```typescript
+import fp from "fastify-plugin";
+import helmet from "@fastify/helmet";
+
+// @fastify/helmet sets all recommended security headers
+await server.register(helmet, {
+  contentSecurityPolicy: false, // We set CSP manually (see above)
+  crossOriginEmbedderPolicy: false, // Only needed for SharedArrayBuffer
+});
+
+// Additional manual headers
+server.addHook("onSend", async (request, reply) => {
+  reply.header("X-Content-Type-Options", "nosniff");
+  reply.header("X-Frame-Options", "DENY");
+  reply.header("Referrer-Policy", "strict-origin-when-cross-origin");
+  reply.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  reply.header("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+});
+```
+
+Install `@fastify/helmet`:
 
 ```bash
-go get github.com/go-playground/validator/v10
+pnpm add @fastify/helmet
 ```
-
-```go
-package transport
-
-import (
-    "github.com/go-playground/validator/v10"
-)
-
-var validate = validator.New()
-
-type CreateUserRequest struct {
-    Email string `json:"email" validate:"required,email,max=254"`
-    Name  string `json:"name"  validate:"required,min=2,max=100"`
-    Role  string `json:"role"  validate:"required,oneof=admin editor viewer"`
-}
-
-func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
-    var req CreateUserRequest
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        h.writeError(w, r, fmt.Errorf("%w: invalid JSON", domain.ErrValidation))
-        return
-    }
-
-    if err := validate.Struct(req); err != nil {
-        h.writeError(w, r, toValidationError(err))
-        return
-    }
-
-    // Safe to use req now
-}
-```
-
-### Validation Rules
-
-| Input Type | Rules |
-|---|---|
-| Email | Max 254 chars, RFC 5322 format |
-| Free text | Max length, strip leading/trailing whitespace |
-| Integers | Range check (min/max) |
-| UUIDs | Parse with `uuid.Parse()` — reject malformed |
-| Enums | `oneof` validator — reject unknown values |
-| URLs | Parse with `url.Parse()`, check scheme is `https` |
-| File uploads | Check MIME type, max size, scan content |
-
----
-
-## SQL Injection Prevention
-
-RBKL uses `sqlc` for all database queries, which generates parameterized queries. Raw SQL interpolation is **never** allowed.
-
-```go
-// ✅ Parameterized — safe
-pool.QueryRow(ctx, "SELECT id FROM users WHERE email = $1", email)
-
-// ❌ String interpolation — SQL injection vulnerability
-pool.QueryRow(ctx, "SELECT id FROM users WHERE email = '"+email+"'")
-```
-
-CI enforces a `sqlc vet` check that fails if any query uses unsafe constructs.
-
----
-
-## Secrets Management
-
-See [Configuration Management](configuration.md) for full details.
-
-Summary:
-- **No secrets in source code** — blocked by pre-commit hooks (see below).
-- **No secrets in config files** — use Azure Key Vault or environment injection.
-- **No secrets in logs** — use the `Redacted` type pattern.
-- **No secrets in error messages** — returned to clients.
 
 ---
 
 ## Dependency Scanning
 
-### `govulncheck`
+### `npm audit`
 
-Run `govulncheck` on every CI pipeline to detect known vulnerabilities in Go dependencies:
+Run `npm audit` (or `pnpm audit`) on every CI pipeline:
 
 ```bash
-go install golang.org/x/vuln/cmd/govulncheck@latest
-govulncheck ./...
+pnpm audit --audit-level=high
 ```
 
-CI fails if any vulnerability with a fix available is detected.
+CI fails on any `high` or `critical` severity vulnerability with a fix available.
 
 ### Dependabot
 
@@ -113,22 +167,26 @@ Enable Dependabot in `.github/dependabot.yml`:
 ```yaml
 version: 2
 updates:
-  - package-ecosystem: "gomod"
+  - package-ecosystem: "npm"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
+    groups:
+      react:
+        patterns: ["react", "react-dom", "@types/react*"]
+      azure:
+        patterns: ["@azure/*", "@azure-rest/*"]
 ```
 
 ---
 
 ## Pre-commit Hooks for Secrets Detection
 
-Every repository includes a `.pre-commit-config.yaml` that runs `gitleaks` to prevent secrets from being committed:
-
 ```yaml
+# .pre-commit-config.yaml
 repos:
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.18.2
@@ -136,130 +194,93 @@ repos:
       - id: gitleaks
 ```
 
-Install hooks on repository clone:
-```bash
-pip install pre-commit
-pre-commit install
-```
-
-CI also runs `gitleaks` on every push as a non-bypassable check.
+Also run `gitleaks` in CI as a non-bypassable check (see [CI/CD](ci-cd.md)).
 
 ---
 
 ## OWASP Top 10 Mitigations
 
 ### A01: Broken Access Control
-- JWT validation and RBAC middleware on every protected route (see [Authentication](authentication.md)).
-- No security decisions based on client-supplied headers (`X-User-ID`, `X-Role`).
-- Resources are owned — always filter by the authenticated user's tenant.
+- JWT validation + RBAC middleware on every protected route (see [Authentication](authentication.md)).
+- No security decisions based on client-supplied headers.
+- Always filter data by the authenticated user's tenant ID.
 
 ### A02: Cryptographic Failures
-- All communication over TLS 1.2+. No HTTP (only HTTPS/H2).
-- Passwords (if ever stored) hashed with `bcrypt` cost ≥ 12 or `argon2id`.
-- No MD5 or SHA-1 for security-sensitive operations.
-- Secrets always 256-bit or longer, generated with `crypto/rand`.
+- All communication over HTTPS (TLS 1.2+). HTTP is not permitted.
+- Passwords hashed with `bcrypt` (cost ≥ 12) or `argon2id`.
+- No MD5 or SHA-1 for security-sensitive hashing.
+- Tokens generated with `crypto.randomBytes(32)` — never `Math.random()`.
 
-```go
-// ✅ Correct random token generation
-import "crypto/rand"
-import "encoding/hex"
+```typescript
+// ✅ Cryptographically secure token
+import { randomBytes } from "crypto";
+const token = randomBytes(32).toString("hex");
 
-func generateToken(n int) (string, error) {
-    b := make([]byte, n)
-    if _, err := rand.Read(b); err != nil {
-        return "", err
-    }
-    return hex.EncodeToString(b), nil
-}
-
-// ❌ Insecure — predictable
-token := fmt.Sprintf("%d", math_rand.Int63())
+// ❌ Predictable
+const token = Math.random().toString(36);
 ```
 
 ### A03: Injection
-- All SQL via parameterized queries (enforced by `sqlc`).
-- HTML output escaped via `html/template` (never `text/template` for HTML).
-- Shell command execution forbidden. If required, use explicit argument lists (no shell expansion).
+- All database access through Prisma parameterized queries.
+- Never use `prisma.$queryRawUnsafe()` with user-supplied input.
+- HTML sanitized with DOMPurify before `dangerouslySetInnerHTML`.
+- No `eval()`, `new Function()`, or dynamic `import()` with user input.
 
 ### A04: Insecure Design
 - Threat model documented for every service in `docs/threat-model.md`.
-- No debug endpoints exposed in production (`/debug/pprof`, `/metrics` behind auth).
+- Debug endpoints (`/metrics`, profiling) protected by auth or removed in production.
 
 ### A05: Security Misconfiguration
-- No default credentials. All credentials are rotated secrets.
-- Detailed error messages only in non-production environments.
-- HTTP security headers on all responses (see below).
+- `@fastify/helmet` enabled on all services.
+- No default or hard-coded credentials.
+- Detailed error messages only returned in non-production environments.
+- `NODE_ENV` is always set explicitly — never rely on its absence.
 
 ### A06: Vulnerable & Outdated Components
-- `govulncheck` and Dependabot (see above).
-- Base Docker images use specific digests, updated monthly.
+- `pnpm audit` + Dependabot (see above).
+- Node.js base images use specific digest pins in Dockerfiles.
 
-### A07: Identification and Authentication Failures
+### A07: Authentication Failures
 - Short-lived JWT tokens (max 1 hour).
-- Token refresh via OIDC refresh tokens — not long-lived access tokens.
-- No credentials in URLs (query parameters or paths).
+- No credentials in URLs (query parameters).
+- Tokens stored in memory or `sessionStorage` — **never `localStorage`**.
+- PKCE flow required for all public SPA clients.
 
 ### A08: Software and Data Integrity Failures
-- All Go module downloads verified against `go.sum`.
-- Docker images signed and verified in the deployment pipeline.
-- CI artifacts are not modifiable after production.
+- All NPM packages verified by `pnpm audit` and `package-lock.json`/`pnpm-lock.yaml`.
+- Docker images signed in the deployment pipeline.
 
-### A09: Security Logging and Monitoring Failures
-- All authentication failures logged (see [Logging](logging.md)).
-- Alerting configured for repeated 401/403 errors (potential brute force).
+### A09: Security Logging and Monitoring
+- All authentication failures logged at `info` (see [Logging](logging.md)).
+- Alerts configured for repeated 401/403 responses.
 - Audit log for all write operations on sensitive resources.
 
-### A10: Server-Side Request Forgery (SSRF)
+### A10: SSRF
 - Never make HTTP requests to URLs supplied directly by clients.
-- If required, validate against an allowlist of approved domains.
-- Block requests to private IP ranges (`10.x`, `172.16.x`, `192.168.x`, `169.254.x`).
-
----
-
-## HTTP Security Headers
-
-Apply these headers to all HTTP responses via middleware:
-
-```go
-func SecurityHeaders(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("X-Content-Type-Options", "nosniff")
-        w.Header().Set("X-Frame-Options", "DENY")
-        w.Header().Set("X-XSS-Protection", "0")            // Disabled — rely on CSP
-        w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-        w.Header().Set("Content-Security-Policy", "default-src 'none'")
-        w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        next.ServeHTTP(w, r)
-    })
-}
-```
+- Validate URLs against an allowlist of approved domains.
+- Block requests to link-local and private IP ranges in any outbound HTTP client.
 
 ---
 
 ## Rate Limiting
 
-All public-facing APIs must implement rate limiting. Use token bucket algorithm via `golang.org/x/time/rate` or a Redis-backed distributed rate limiter for multi-instance deployments.
+```typescript
+import rateLimit from "@fastify/rate-limit";
 
-```go
-import "golang.org/x/time/rate"
-
-// Per-IP rate limiter: 10 requests/second, burst of 20
-limiter := rate.NewLimiter(rate.Limit(10), 20)
-
-func RateLimit(limiter *rate.Limiter) func(http.Handler) http.Handler {
-    return func(next http.Handler) http.Handler {
-        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            if !limiter.Allow() {
-                w.Header().Set("Retry-After", "1")
-                http.Error(w, `{"title":"Too Many Requests","status":429}`, http.StatusTooManyRequests)
-                return
-            }
-            next.ServeHTTP(w, r)
-        })
-    }
-}
+await server.register(rateLimit, {
+  global: true,
+  max: 100,           // 100 requests per window
+  timeWindow: 60_000, // 1 minute
+  keyGenerator: (request) =>
+    request.jwtClaims?.sub ?? request.ip, // Per-user when authenticated, per-IP otherwise
+  errorResponseBuilder: () => ({
+    title: "Too Many Requests",
+    status: 429,
+  }),
+});
 ```
+
+Install: `pnpm add @fastify/rate-limit`
 
 ---
 

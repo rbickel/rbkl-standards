@@ -2,177 +2,208 @@
 
 ← [Back to README](../README.md)
 
-## Repository Layout
+## Monorepo Layout
 
-Every RBKL Go service follows the same top-level layout. Consistency makes it trivial for engineers and coding agents to orient themselves in any repository.
+RBKL uses a **monorepo** strategy managed with **pnpm workspaces**. All applications and shared packages for a product live in a single repository. This enables atomic changes across the stack, shared tooling, and easy dependency sharing.
 
 ```
-my-service/
-├── cmd/
-│   └── server/
-│       └── main.go          # Entry point — wire dependencies, start server
-├── internal/
-│   ├── config/              # Configuration loading & validation
-│   ├── domain/              # Core business types (no external dependencies)
-│   ├── handler/             # HTTP handlers (thin layer, no business logic)
-│   ├── middleware/          # Custom HTTP middleware
-│   ├── repository/          # Data access implementations
-│   ├── service/             # Business logic orchestration
-│   └── transport/           # Request/response DTOs and mapping
-├── pkg/                     # Exported packages safe to use by other services
-├── migrations/              # SQL migration files (golang-migrate format)
-├── api/
-│   └── openapi.yaml         # OpenAPI 3.x spec (source of truth)
-├── docs/                    # Additional documentation (ADRs, runbooks)
-├── scripts/                 # Build, seed, and utility scripts
+my-product/
+├── apps/
+│   ├── api/                     # Fastify backend service
+│   │   ├── src/
+│   │   │   ├── config/          # Config loading & Zod validation
+│   │   │   ├── domain/          # Core business types & interfaces
+│   │   │   ├── plugins/         # Fastify plugins (auth, db, etc.)
+│   │   │   ├── routes/          # Route handlers (thin layer)
+│   │   │   ├── services/        # Business logic
+│   │   │   ├── repositories/    # Data access (Prisma wrappers)
+│   │   │   ├── middleware/      # Custom Fastify hooks & decorators
+│   │   │   └── index.ts         # Entry point
+│   │   ├── prisma/
+│   │   │   ├── schema.prisma    # Prisma schema (source of truth)
+│   │   │   └── migrations/      # Generated migration files
+│   │   ├── tests/
+│   │   │   ├── unit/
+│   │   │   └── integration/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   │
+│   └── web/                     # React frontend (Vite)
+│       ├── src/
+│       │   ├── components/      # Reusable UI components
+│       │   ├── features/        # Feature-scoped modules (co-located)
+│       │   ├── hooks/           # Shared React hooks
+│       │   ├── lib/             # Utility functions & API client
+│       │   ├── pages/           # Route-level page components
+│       │   ├── stores/          # Zustand state stores
+│       │   ├── types/           # Shared TypeScript types
+│       │   └── main.tsx         # Entry point
+│       ├── public/
+│       ├── tests/
+│       ├── index.html
+│       ├── vite.config.ts
+│       ├── package.json
+│       └── tsconfig.json
+│
+├── packages/
+│   ├── ui/                      # Shared React component library
+│   ├── types/                   # Shared TypeScript types (API contracts)
+│   └── utils/                   # Shared pure utility functions
+│
 ├── .github/
-│   └── workflows/           # CI/CD pipeline definitions
-├── Dockerfile
-├── docker-compose.yaml      # Local development environment
-├── go.mod
-├── go.sum
-├── Makefile
+│   └── workflows/               # CI/CD pipeline definitions
+├── .eslintrc.cjs                # Root ESLint config (extended by each app)
+├── .prettierrc                  # Root Prettier config
+├── docker-compose.yaml          # Local development environment
+├── pnpm-workspace.yaml
+├── package.json                 # Root package (dev tooling only)
+├── turbo.json                   # Turborepo build pipeline
 └── README.md
 ```
 
 ### Key Rules
 
-- **`cmd/`** contains only `main.go` files. Each subdirectory is a separate binary. `main.go` wires everything together and starts the application — it contains no business logic.
-- **`internal/`** is Go's way of preventing external packages from importing your internals. Always prefer `internal/` over `pkg/` unless you intentionally export the package for use by other services.
-- **`pkg/`** is for genuinely reusable code. If in doubt, put it in `internal/`.
-- **`domain/`** contains pure business types and interfaces. It **must not** import any external packages or framework code.
-- **`repository/`** implements the storage interfaces defined in `domain/`. It imports `pgx`, Redis clients, etc.
-- **`service/`** contains business logic. It depends on `domain/` interfaces only — never on concrete implementations.
+- **`apps/`** contains deployable applications. Each has its own `package.json`, `tsconfig.json`, and build output.
+- **`packages/`** contains shared libraries consumed by apps. They are never deployed independently.
+- **`packages/types`** is the single source of truth for API request/response types shared between `api` and `web`.
+- Business logic lives in `services/` — route handlers must never contain business logic.
+- `repositories/` are the only files that import from Prisma's generated client.
 
 ---
 
-## Monorepo vs. Polyrepo
+## Tooling
 
-RBKL uses a **polyrepo** strategy: one repository per deployable service or library.
+| Tool | Purpose |
+|---|---|
+| `pnpm` v9 | Package manager and workspace orchestration |
+| `Turborepo` | Build pipeline caching and task dependency graph |
+| `TypeScript` 5.x | Language (strict mode required) |
+| `ESLint` + `eslint-config-rbkl` | Linting |
+| `Prettier` | Code formatting |
+| `Vite` v5 | Frontend build tool and dev server |
 
-**Rationale:**
-- Independent CI/CD pipelines and release cadences.
-- Smaller blast radius for dependency updates.
-- Clearer ownership boundaries.
+---
 
-**Shared libraries** live in dedicated repositories under the `rbkl` GitHub organization (e.g., `rbkl/go-middleware`, `rbkl/go-auth`).
+## TypeScript Configuration
+
+### Root `tsconfig.base.json`
+
+All apps extend this base:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": false,
+    "esModuleInterop": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}
+```
+
+**`strict: true` is non-negotiable.** It enables: `strictNullChecks`, `noImplicitAny`, `strictFunctionTypes`, and more.
 
 ---
 
 ## Naming Conventions
 
 ### Files
+
 | Type | Convention | Example |
 |---|---|---|
-| Go source | `snake_case.go` | `user_service.go` |
-| Test file | `<file>_test.go` | `user_service_test.go` |
-| Migration | `{version}_{description}.{up\|down}.sql` | `000001_create_users.up.sql` |
+| TypeScript source | `kebab-case.ts` | `user-service.ts` |
+| React component | `PascalCase.tsx` | `UserCard.tsx` |
+| Test file | `*.test.ts` or `*.spec.ts` | `user-service.test.ts` |
+| Prisma migration | Auto-generated | `20260320_create_users/` |
 | Environment | `.env.{environment}` | `.env.local`, `.env.test` |
 
-### Packages
-- All lowercase, single word when possible: `handler`, `service`, `config`.
-- Avoid stutter: `user.UserService` → `user.Service`.
-- Avoid generic names: `util`, `common`, `helpers`, `misc`.
+### Variables, Functions, Classes
 
-### Variables & Functions
-- Use `camelCase` for unexported identifiers, `PascalCase` for exported.
-- Acronyms are all-caps: `userID`, `HTTPClient`, `parseURL`.
-- Receiver names are 1–2 letter abbreviations of the type: `(s *UserService)`, `(h *Handler)`.
-- Boolean variables and functions use positive framing: `isActive`, `hasPermission` (not `notDisabled`).
+| Identifier | Convention | Example |
+|---|---|---|
+| Variables & functions | `camelCase` | `getUserById`, `isActive` |
+| Classes & interfaces | `PascalCase` | `UserService`, `CreateUserDto` |
+| Constants | `SCREAMING_SNAKE_CASE` | `MAX_RETRY_ATTEMPTS` |
+| React components | `PascalCase` | `UserCard`, `AuthProvider` |
+| Type/interface props | `camelCase` | `userId`, `createdAt` |
+| Enum values | `PascalCase` | `UserRole.Admin` |
+| Files (non-React) | `kebab-case` | `user-service.ts` |
 
-### Constants and Errors
-```go
-// Constants: PascalCase if exported, camelCase if not
-const MaxRetryAttempts = 3
+### Interfaces vs. Types
 
-// Sentinel errors: ErrXxx
-var ErrNotFound = errors.New("not found")
-var ErrUnauthorized = errors.New("unauthorized")
-```
+- Use `interface` for object shapes that may be extended.
+- Use `type` for unions, intersections, and computed types.
+- Never use `I` prefix on interfaces (`IUserService` → `UserService`).
 
 ---
 
-## Entry Point Pattern
+## Entry Point Pattern (Backend)
 
-`cmd/server/main.go` must follow this structure:
+`apps/api/src/index.ts` must follow this structure:
 
-```go
-package main
+```typescript
+import { buildServer } from "./server.js";
+import { loadConfig } from "./config/index.js";
+import { logger } from "./lib/logger.js";
 
-import (
-    "context"
-    "log/slog"
-    "os"
-    "os/signal"
-    "syscall"
+async function main(): Promise<void> {
+  const config = loadConfig(); // Throws on invalid config
 
-    "github.com/rbkl/my-service/internal/config"
-    "github.com/rbkl/my-service/internal/server"
-)
+  const server = await buildServer(config);
 
-func main() {
-    ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-    defer cancel()
+  const shutdown = async (): Promise<void> => {
+    logger.info("Shutdown signal received");
+    await server.close();
+    process.exit(0);
+  };
 
-    cfg, err := config.Load()
-    if err != nil {
-        slog.Error("failed to load config", "error", err)
-        os.Exit(1)
-    }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
-    app, err := server.New(cfg)
-    if err != nil {
-        slog.Error("failed to initialize server", "error", err)
-        os.Exit(1)
-    }
-
-    if err := app.Run(ctx); err != nil {
-        slog.Error("server exited with error", "error", err)
-        os.Exit(1)
-    }
+  await server.listen({ port: config.PORT, host: "0.0.0.0" });
 }
-```
 
-Key properties:
-- Signal handling via `signal.NotifyContext` — not raw `os.Signal` channels.
-- `os.Exit(1)` only in `main` — never in library code.
-- All wiring happens in `server.New()`, not in `main`.
+main().catch((err) => {
+  logger.error({ err }, "Fatal startup error");
+  process.exit(1);
+});
+```
 
 ---
 
-## Makefile
+## `package.json` Scripts
 
-Every repository includes a `Makefile` with these standard targets:
+Every app includes these standard scripts:
 
-```makefile
-.PHONY: build test lint fmt generate migrate-up migrate-down docker-build
-
-build:
-	go build -o bin/server ./cmd/server
-
-test:
-	go test -race -coverprofile=coverage.out ./...
-
-lint:
-	golangci-lint run ./...
-
-fmt:
-	gofmt -w .
-	goimports -w .
-
-generate:
-	go generate ./...
-
-migrate-up:
-	migrate -path migrations -database "$$DATABASE_URL" up
-
-migrate-down:
-	migrate -path migrations -database "$$DATABASE_URL" down 1
-
-docker-build:
-	docker build -t my-service:local .
+```json
+{
+  "scripts": {
+    "build": "tsc --build",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src --ext .ts,.tsx",
+    "lint:fix": "eslint src --ext .ts,.tsx --fix",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "prisma migrate deploy",
+    "db:generate": "prisma generate",
+    "db:studio": "prisma studio"
+  }
+}
 ```
 
 ---
 
 _[← Overview](overview.md) · [Web Servers →](web-servers.md)_
+

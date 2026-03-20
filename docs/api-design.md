@@ -8,7 +8,7 @@ RBKL APIs are:
 
 1. **RESTful** — Resources are nouns; HTTP methods are verbs.
 2. **Versioned from day one** — URL path versioning (`/v1/`).
-3. **OpenAPI-first** — The spec is written before the implementation.
+3. **OpenAPI-first** — The spec is generated from route schemas using `@fastify/swagger`.
 4. **Consistent** — Same conventions across all services.
 
 ---
@@ -29,12 +29,12 @@ https://api.rbkl.com/{service}/{version}/{resource}/{id}/{sub-resource}
 
 Examples:
 ```
-GET  /v1/users
-GET  /v1/users/usr_01HX
-POST /v1/users
-PUT  /v1/users/usr_01HX
+GET    /v1/users
+GET    /v1/users/usr_01HX
+POST   /v1/users
+PUT    /v1/users/usr_01HX
 DELETE /v1/users/usr_01HX
-GET  /v1/users/usr_01HX/addresses
+GET    /v1/users/usr_01HX/addresses
 ```
 
 ---
@@ -52,8 +52,8 @@ GET  /v1/users/usr_01HX/addresses
 **Rules:**
 - `GET` requests must never modify state.
 - `DELETE` returns `204 No Content` on success.
-- `PUT` must be idempotent — calling it twice produces the same result.
-- Avoid `PATCH` unless partial updates are explicitly required; prefer `PUT` with full replacement.
+- `PUT` must be idempotent.
+- Prefer `PUT` over `PATCH` unless partial updates are explicitly required.
 
 ---
 
@@ -61,15 +61,15 @@ GET  /v1/users/usr_01HX/addresses
 
 | Code | Meaning | When |
 |---|---|---|
-| `200 OK` | Success | `GET`, `PUT`, `PATCH` returns data |
+| `200 OK` | Success | `GET`, `PUT`, `PATCH` with response body |
 | `201 Created` | Resource created | `POST` that creates a resource |
-| `204 No Content` | Success, no body | `DELETE`, `PUT` with no response body |
-| `400 Bad Request` | Invalid request syntax or payload | JSON parse error, missing required field |
+| `204 No Content` | Success, no body | `DELETE`, `PUT` with no response |
+| `400 Bad Request` | Malformed syntax or payload | JSON parse error |
 | `401 Unauthorized` | Missing or invalid authentication | No/invalid JWT |
 | `403 Forbidden` | Authenticated but not authorized | Insufficient role |
 | `404 Not Found` | Resource does not exist | ID not found |
 | `409 Conflict` | State conflict | Duplicate email, concurrent write |
-| `422 Unprocessable Entity` | Semantic validation failure | Email format invalid, name too short |
+| `422 Unprocessable Entity` | Semantic validation failure | Invalid email format |
 | `429 Too Many Requests` | Rate limit exceeded | — |
 | `500 Internal Server Error` | Unexpected server error | Unhandled error |
 | `503 Service Unavailable` | Dependency unavailable | Readiness check failed |
@@ -94,31 +94,27 @@ RBKL does **not** wrap single-resource responses in an envelope:
   "name": "Alice"
 }
 
-// ❌ Wrong — unnecessary envelope
+// ❌ Wrong — unnecessary wrapper
 {
-  "data": {
-    "id": "usr_01HX",
-    ...
-  },
+  "data": { "id": "usr_01HX" },
   "success": true
 }
 ```
 
 ### Collection Responses
 
-Collections use a standard envelope to support pagination metadata:
+Collections use a standard envelope for pagination metadata:
 
 ```json
 {
   "items": [
-    {"id": "usr_01HX", "email": "alice@rbkl.com"},
-    {"id": "usr_02HX", "email": "bob@rbkl.com"}
+    { "id": "usr_01HX", "email": "alice@rbkl.com" },
+    { "id": "usr_02HX", "email": "bob@rbkl.com" }
   ],
   "pagination": {
     "total": 42,
     "limit": 20,
-    "offset": 0,
-    "next_cursor": "eyJpZCI6InVzcl8wMkhYIn0="
+    "nextCursor": "eyJpZCI6InVzcl8wMkhYIn0="
   }
 }
 ```
@@ -127,33 +123,34 @@ Collections use a standard envelope to support pagination metadata:
 
 ## Pagination
 
-Use **cursor-based pagination** for all list endpoints. Offset pagination is only acceptable for admin interfaces with small datasets (< 10,000 records).
+Use **cursor-based pagination** for all list endpoints. Offset pagination is only acceptable for admin interfaces with datasets < 10,000 records.
 
 ### Request Parameters
 
 | Parameter | Type | Default | Max | Description |
 |---|---|---|---|---|
-| `limit` | int | 20 | 100 | Number of items per page |
+| `limit` | number | 20 | 100 | Items per page |
 | `cursor` | string | — | — | Opaque cursor from previous response |
 
-### Implementation
+### TypeBox Schema
 
-```go
-type ListUsersParams struct {
-    Limit  int    `schema:"limit"`
-    Cursor string `schema:"cursor"`
+```typescript
+import { Type, Static } from "@sinclair/typebox";
+
+const ListQuerySchema = Type.Object({
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20 })),
+  cursor: Type.Optional(Type.String()),
+});
+
+type ListQuery = Static<typeof ListQuerySchema>;
+
+// Cursor is base64-encoded JSON: { "id": "last-seen-id" }
+function encodeCursor(id: string): string {
+  return Buffer.from(JSON.stringify({ id })).toString("base64url");
 }
 
-type PageInfo struct {
-    Total      int64  `json:"total"`
-    Limit      int    `json:"limit"`
-    NextCursor string `json:"next_cursor,omitempty"`
-}
-
-// Cursor is a base64-encoded JSON object: {"id": "last-seen-id", "ts": 1234567890}
-func encodeCursor(id string, ts time.Time) string {
-    data, _ := json.Marshal(map[string]any{"id": id, "ts": ts.Unix()})
-    return base64.URLEncoding.EncodeToString(data)
+function decodeCursor(cursor: string): { id: string } {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString());
 }
 ```
 
@@ -167,14 +164,14 @@ Use query parameters with the field name as the key:
 
 ```
 GET /v1/users?status=active&role=admin
-GET /v1/orders?created_after=2026-01-01T00:00:00Z&created_before=2026-03-01T00:00:00Z
+GET /v1/orders?createdAfter=2026-01-01T00:00:00Z&createdBefore=2026-03-01T00:00:00Z
 ```
 
 ### Sorting
 
 ```
-GET /v1/users?sort=created_at&order=desc
-GET /v1/users?sort=-created_at          # Shorthand: - prefix for descending
+GET /v1/users?sort=createdAt&order=desc
+GET /v1/users?sort=-createdAt     # Shorthand: - prefix for descending
 ```
 
 Only expose sorting on indexed columns. Document supported sort fields in the OpenAPI spec.
@@ -183,14 +180,14 @@ Only expose sorting on indexed columns. Document supported sort fields in the Op
 
 ## API Versioning
 
-RBKL uses **URL path versioning**. The version number is a single integer incremented on breaking changes.
+RBKL uses **URL path versioning**. Increment the version integer on breaking changes.
 
 ### What Constitutes a Breaking Change?
 
 - Removing or renaming a field in a response.
 - Changing a field's type.
 - Removing an endpoint.
-- Changing required/optional status of a request parameter.
+- Changing required/optional status of a parameter.
 - Changing authentication requirements.
 
 ### What Is NOT a Breaking Change?
@@ -203,11 +200,11 @@ RBKL uses **URL path versioning**. The version number is a single integer increm
 
 | Status | Description |
 |---|---|
-| `current` | The latest stable version — all new clients should use it |
-| `deprecated` | Supported for 12 months after successor version is released |
-| `sunset` | No longer functional — returns `410 Gone` |
+| `current` | Latest stable version — all new clients use this |
+| `deprecated` | Supported for 12 months after successor is released |
+| `sunset` | Returns `410 Gone` |
 
-Include `Deprecation` and `Sunset` headers on deprecated endpoints:
+Include these headers on deprecated endpoints:
 
 ```
 Deprecation: true
@@ -217,39 +214,61 @@ Link: <https://api.rbkl.com/v2/users>; rel="successor-version"
 
 ---
 
-## OpenAPI 3.x Specification
+## OpenAPI 3.x with `@fastify/swagger`
 
-Every service **must** include a complete `api/openapi.yaml` specification. The spec is the **source of truth** for the API contract.
+Every service generates an OpenAPI 3.x spec automatically from route schemas.
 
-### Requirements
+### Setup
+
+```typescript
+import swagger from "@fastify/swagger";
+import swaggerUi from "@fastify/swagger-ui";
+
+await server.register(swagger, {
+  openapi: {
+    info: {
+      title: "User Service API",
+      version: "1.0.0",
+    },
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "JWT",
+        },
+      },
+    },
+    security: [{ bearerAuth: [] }],
+  },
+});
+
+await server.register(swaggerUi, {
+  routePrefix: "/docs",
+  uiConfig: { deepLinking: true },
+});
+```
+
+### OpenAPI Requirements
 
 - All endpoints documented with request/response schemas.
-- All possible error response codes documented.
-- `operationId` set on every operation (used for code generation).
-- Security schemes defined and applied to all authenticated endpoints.
+- All error response codes included.
+- `operationId` set on every route.
 - Examples provided for all request/response bodies.
-
-### Code Generation
-
-Use `oapi-codegen` to generate server stubs and client code from the spec:
-
-```bash
-go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest
-oapi-codegen -generate chi-server,types -package api api/openapi.yaml > internal/api/server.gen.go
-```
+- Spec available at `/docs` (dev/staging only — blocked in production).
 
 ---
 
 ## Idempotency
 
-For non-idempotent operations (`POST`) that must be safe to retry (e.g., payment processing, email sending), support the `Idempotency-Key` header.
+For non-idempotent operations (`POST`) that must be safe to retry (payment processing, emails), support the `Idempotency-Key` header:
 
 ```
 POST /v1/payments
 Idempotency-Key: 4f0d6a09-3e1c-4d9f-9c85-2a1b3e5f7890
 ```
 
-The server stores the response keyed by the idempotency key for 24 hours. Subsequent requests with the same key return the cached response without re-executing the operation.
+The server stores the response keyed by the idempotency key for 24 hours. Subsequent requests with the same key return the cached response.
 
 ---
 

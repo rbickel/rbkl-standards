@@ -6,215 +6,218 @@
 
 | Component | Library | Version |
 |---|---|---|
-| HTTP framework | `net/http` (stdlib) + `chi` router | `chi` v5 |
-| Middleware | `chi/middleware` + custom RBKL middleware | — |
-| JSON encoding | `encoding/json` (stdlib) or `json-iterator/go` | latest |
+| HTTP framework | **Fastify** | v4 |
+| OpenAPI / Swagger | `@fastify/swagger` + `@fastify/swagger-ui` | latest |
+| CORS | `@fastify/cors` | latest |
+| JWT plugin | `@fastify/jwt` (wraps `jose`) | latest |
+| Static files | `@fastify/static` | latest |
+| Request validation | Built-in (JSON Schema via `ajv`) | — |
 
-> **Why `chi`?** Chi is a lightweight, idiomatic router built on `net/http`. It adds zero magic — handlers are standard `http.HandlerFunc` values, so there is no vendor lock-in and testing is trivial. It also has an excellent middleware ecosystem.
-
----
-
-## Router Setup
-
-```go
-package server
-
-import (
-    "net/http"
-    "time"
-
-    "github.com/go-chi/chi/v5"
-    "github.com/go-chi/chi/v5/middleware"
-    rbklmw "github.com/rbkl/go-middleware"
-)
-
-func newRouter(cfg *config.Config, h *handler.Handler) http.Handler {
-    r := chi.NewRouter()
-
-    // ── Global middleware (applied to every request) ──────────────────────────
-    r.Use(middleware.RequestID)          // Inject X-Request-ID header
-    r.Use(rbklmw.RequestLogger)          // Structured request/response logging
-    r.Use(middleware.Recoverer)          // Recover from panics, return 500
-    r.Use(middleware.RealIP)             // Trust X-Forwarded-For / X-Real-IP
-    r.Use(middleware.Timeout(30 * time.Second)) // Request deadline
-    r.Use(rbklmw.CORS(cfg.AllowedOrigins))      // CORS policy
-
-    // ── Public routes ─────────────────────────────────────────────────────────
-    r.Get("/healthz", h.Health)
-    r.Get("/readyz", h.Ready)
-
-    // ── API v1 ────────────────────────────────────────────────────────────────
-    r.Route("/v1", func(r chi.Router) {
-        r.Use(rbklmw.Authenticate(cfg.JWKS))  // JWT authentication
-        r.Use(rbklmw.Authorize)               // RBAC enforcement
-
-        r.Route("/users", func(r chi.Router) {
-            r.Get("/", h.ListUsers)
-            r.Post("/", h.CreateUser)
-            r.Route("/{userID}", func(r chi.Router) {
-                r.Get("/", h.GetUser)
-                r.Put("/", h.UpdateUser)
-                r.Delete("/", h.DeleteUser)
-            })
-        })
-    })
-
-    return r
-}
-```
+> **Why Fastify?** Fastify is the fastest production-grade Node.js HTTP framework. It has a built-in schema-based request/response validator (no extra library needed), first-class TypeScript support, a structured plugin system, and Pino as its built-in logger.
 
 ---
 
-## Middleware Stack
+## Server Setup
 
-Apply middleware **in this order** on every service. The ordering matters — each layer wraps the next.
+```typescript
+// apps/api/src/server.ts
+import Fastify, { FastifyInstance } from "fastify";
+import cors from "@fastify/cors";
+import { userRoutes } from "./routes/users.js";
+import { authPlugin } from "./plugins/auth.js";
+import { prismaPlugin } from "./plugins/prisma.js";
+import type { Config } from "./config/index.js";
 
-| Order | Middleware | Purpose |
-|---|---|---|
-| 1 | `middleware.RequestID` | Assign unique ID to each request |
-| 2 | `rbklmw.RequestLogger` | Log request start/end with correlation ID |
-| 3 | `middleware.Recoverer` | Catch panics, return `500`, log the stack trace |
-| 4 | `middleware.RealIP` | Extract real client IP from proxy headers |
-| 5 | `middleware.Timeout` | Enforce a 30-second maximum request duration |
-| 6 | `rbklmw.CORS` | Apply CORS policy from config |
-| 7 | `rbklmw.Authenticate` | Validate JWT; populate claims in context |
-| 8 | `rbklmw.Authorize` | Enforce RBAC roles against required permissions |
+export async function buildServer(config: Config): Promise<FastifyInstance> {
+  const server = Fastify({
+    logger: {
+      level: config.LOG_LEVEL,
+      // pino-pretty in dev, raw JSON in production
+      transport: config.NODE_ENV !== "production"
+        ? { target: "pino-pretty", options: { colorize: true } }
+        : undefined,
+    },
+    requestIdHeader: "x-request-id",
+    requestIdLogLabel: "requestId",
+    disableRequestLogging: false,
+  });
 
-### Custom Middleware Pattern
+  // ── Global plugins ────────────────────────────────────────────────────────
+  await server.register(cors, {
+    origin: config.ALLOWED_ORIGINS,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Authorization", "Content-Type", "X-Request-ID"],
+    credentials: true,
+  });
 
-All custom middleware must follow the standard `chi` / `net/http` pattern:
+  // ── Application plugins ───────────────────────────────────────────────────
+  await server.register(prismaPlugin);  // Decorates server with server.prisma
+  await server.register(authPlugin, { config }); // JWT validation
 
-```go
-func MyMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Pre-processing
-        ctx := context.WithValue(r.Context(), myKey{}, "value")
-        // Call next handler
-        next.ServeHTTP(w, r.WithContext(ctx))
-        // Post-processing (if needed)
-    })
-}
-```
+  // ── Routes ────────────────────────────────────────────────────────────────
+  await server.register(userRoutes, { prefix: "/v1/users" });
 
----
-
-## Request Handling
-
-### Handler Structure
-
-Handlers are thin: they decode the request, call a service, and encode the response. No business logic.
-
-```go
-package handler
-
-type Handler struct {
-    users  UserService
-    logger *slog.Logger
-}
-
-func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
-    ctx := r.Context()
-    id := chi.URLParam(r, "userID")
-
-    user, err := h.users.Get(ctx, id)
-    if err != nil {
-        h.writeError(w, r, err)
-        return
+  // ── Health endpoints ──────────────────────────────────────────────────────
+  server.get("/healthz", { logLevel: "silent" }, async () => ({ status: "ok" }));
+  server.get("/readyz", async (request, reply) => {
+    try {
+      await server.prisma.$queryRaw`SELECT 1`;
+      return { status: "ready" };
+    } catch (err) {
+      request.log.warn({ err }, "Readiness check failed");
+      return reply.status(503).send({ status: "unavailable" });
     }
+  });
 
-    h.writeJSON(w, http.StatusOK, user)
+  return server;
 }
 ```
-
-### JSON Helpers
-
-Every service uses these two helper methods (or the shared `rbkl/go-middleware` equivalents):
-
-```go
-func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(status)
-    if err := json.NewEncoder(w).Encode(v); err != nil {
-        h.logger.Error("failed to encode response", "error", err)
-    }
-}
-
-func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) {
-    problem := toProblemDetails(r, err)
-    h.writeJSON(w, problem.Status, problem)
-}
-```
-
-See [Error Handling](error-handling.md) for the `toProblemDetails` implementation.
 
 ---
 
-## Server Initialization & Graceful Shutdown
+## Plugin Architecture
 
-```go
-package server
+Fastify uses a **plugin** system for all cross-cutting concerns. A plugin is a function that registers decorators, hooks, or routes on a Fastify scope.
 
-import (
-    "context"
-    "errors"
-    "fmt"
-    "log/slog"
-    "net/http"
-    "time"
-)
+### Plugin Pattern
 
-type Server struct {
-    http *http.Server
+```typescript
+// apps/api/src/plugins/prisma.ts
+import fp from "fastify-plugin";
+import { FastifyPluginAsync } from "fastify";
+import { PrismaClient } from "@prisma/client";
+
+declare module "fastify" {
+  interface FastifyInstance {
+    prisma: PrismaClient;
+  }
 }
 
-func New(cfg *config.Config, h *handler.Handler) *Server {
-    return &Server{
-        http: &http.Server{
-            Addr:         fmt.Sprintf(":%d", cfg.Port),
-            Handler:      newRouter(cfg, h),
-            ReadTimeout:  10 * time.Second,
-            WriteTimeout: 30 * time.Second,
-            IdleTimeout:  120 * time.Second,
+const prismaPlugin: FastifyPluginAsync = fp(async (server) => {
+  const prisma = new PrismaClient({
+    log: [{ emit: "event", level: "query" }],
+  });
+
+  await prisma.$connect();
+
+  server.decorate("prisma", prisma);
+
+  server.addHook("onClose", async () => {
+    await prisma.$disconnect();
+  });
+});
+
+export { prismaPlugin };
+```
+
+> **Always wrap plugins with `fastify-plugin`** (`fp`) when you want the decorators/hooks to be available in the parent scope. Without `fp`, Fastify encapsulates the plugin in its own scope.
+
+---
+
+## Request Validation with JSON Schema
+
+Fastify validates requests using JSON Schema **before** the handler runs. Define schemas in separate files and attach them to routes.
+
+```typescript
+// apps/api/src/routes/users.ts
+import { FastifyPluginAsync } from "fastify";
+import { Type, Static } from "@sinclair/typebox"; // TypeBox for schema + TypeScript type
+import { UserService } from "../services/user-service.js";
+
+const CreateUserBody = Type.Object({
+  email: Type.String({ format: "email", maxLength: 254 }),
+  name: Type.String({ minLength: 2, maxLength: 100 }),
+  role: Type.Union([
+    Type.Literal("admin"),
+    Type.Literal("editor"),
+    Type.Literal("viewer"),
+  ]),
+});
+
+type CreateUserBody = Static<typeof CreateUserBody>;
+
+export const userRoutes: FastifyPluginAsync = async (server) => {
+  const userService = new UserService(server.prisma, server.log);
+
+  server.post<{ Body: CreateUserBody }>(
+    "/",
+    {
+      schema: {
+        body: CreateUserBody,
+        response: {
+          201: UserResponse,
+          422: ProblemDetails,
         },
-    }
-}
-
-func (s *Server) Run(ctx context.Context) error {
-    errCh := make(chan error, 1)
-
-    go func() {
-        slog.Info("server starting", "addr", s.http.Addr)
-        if err := s.http.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-            errCh <- err
-        }
-        close(errCh)
-    }()
-
-    select {
-    case err := <-errCh:
-        return fmt.Errorf("server error: %w", err)
-    case <-ctx.Done():
-        slog.Info("shutdown signal received, draining connections")
-        shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-        defer cancel()
-        if err := s.http.Shutdown(shutdownCtx); err != nil {
-            return fmt.Errorf("graceful shutdown failed: %w", err)
-        }
-        slog.Info("server stopped gracefully")
-        return nil
-    }
-}
+      },
+      onRequest: [server.authenticate], // Auth hook from authPlugin
+    },
+    async (request, reply) => {
+      const user = await userService.create(request.body);
+      return reply.status(201).send(user);
+    },
+  );
+};
 ```
 
-**Required timeouts:**
+> **`@sinclair/typebox`** is the approved library for defining JSON Schema that also generates TypeScript types. This avoids duplicating schemas and types.
 
-| Timeout | Value | Reason |
+---
+
+## Hooks (Middleware)
+
+Fastify uses **lifecycle hooks** instead of a middleware chain. Apply them at different scopes.
+
+| Hook | Equivalent | Usage |
 |---|---|---|
-| `ReadTimeout` | 10s | Prevent slowloris attacks |
-| `WriteTimeout` | 30s | Allow time for large responses |
-| `IdleTimeout` | 120s | Keep-alive connection management |
-| Request context timeout | 30s | Applied via middleware |
-| Graceful shutdown | 15s | Drain in-flight requests |
+| `onRequest` | Pre-middleware | Authentication, rate limiting |
+| `preValidation` | Before schema validation | Parse cookies, custom parsing |
+| `preHandler` | Before handler | Authorization (RBAC), request enrichment |
+| `onSend` | Before response sent | Modify response, add headers |
+| `onError` | On error | Error formatting, logging |
+| `onClose` | Server shutdown | Cleanup (DB disconnect) |
+
+```typescript
+// Global hook registered in buildServer
+server.addHook("onRequest", async (request, reply) => {
+  // Runs on every request
+  request.log.info({ method: request.method, url: request.url }, "incoming request");
+});
+
+server.addHook("onError", async (request, reply, error) => {
+  request.log.error({ err: error }, "request error");
+});
+```
+
+---
+
+## Graceful Shutdown
+
+Fastify handles graceful shutdown via `server.close()`, which drains in-flight requests.
+
+```typescript
+// apps/api/src/index.ts
+const shutdown = async (): Promise<void> => {
+  server.log.info("Shutdown signal received — draining connections");
+  try {
+    await server.close(); // Waits for in-flight requests (up to closeGrace)
+    process.exit(0);
+  } catch (err) {
+    server.log.error({ err }, "Error during shutdown");
+    process.exit(1);
+  }
+};
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+```
+
+Configure the close grace period (default: none):
+
+```typescript
+const server = Fastify({
+  closeGrace: 15_000, // 15 seconds to drain in-flight requests
+});
+```
 
 ---
 
@@ -224,51 +227,73 @@ Every service **must** expose these two endpoints (no authentication required):
 
 ### `GET /healthz` — Liveness
 
-Returns `200 OK` if the process is alive. Used by Kubernetes to decide whether to restart the container.
+Returns `200 OK` if the Node.js process is alive.
 
-```go
-func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-    w.WriteHeader(http.StatusOK)
-    _, _ = w.Write([]byte(`{"status":"ok"}`))
-}
+```typescript
+server.get("/healthz", { logLevel: "silent" }, async () => {
+  return { status: "ok" };
+});
 ```
 
 ### `GET /readyz` — Readiness
 
-Returns `200 OK` only if all dependencies (database, cache, etc.) are reachable. Used by Kubernetes to decide whether to send traffic.
+Returns `200 OK` only when all dependencies are ready.
 
-```go
-func (h *Handler) Ready(w http.ResponseWriter, r *http.Request) {
-    ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-    defer cancel()
+```typescript
+server.get("/readyz", async (request, reply) => {
+  try {
+    await server.prisma.$queryRaw`SELECT 1`;
+    return { status: "ready" };
+  } catch (err) {
+    request.log.warn({ err }, "Readiness check failed");
+    return reply.status(503).send({ status: "unavailable" });
+  }
+});
+```
 
-    if err := h.db.PingContext(ctx); err != nil {
-        h.logger.Warn("readiness check failed", "error", err)
-        http.Error(w, `{"status":"unavailable"}`, http.StatusServiceUnavailable)
-        return
-    }
+---
 
-    w.WriteHeader(http.StatusOK)
-    _, _ = w.Write([]byte(`{"status":"ready"}`))
-}
+## Required Server Configuration
+
+```typescript
+const server = Fastify({
+  // Timeouts
+  connectionTimeout: 10_000,       // 10 seconds to establish connection
+  keepAliveTimeout: 72_000,        // 72 seconds keep-alive (above ALB 60s)
+  requestTimeout: 30_000,          // 30 seconds max request processing
+
+  // Limits
+  bodyLimit: 1_048_576,            // 1 MiB body limit
+  maxParamLength: 100,             // URL param max length
+
+  // Logging
+  logger: pinoConfig,
+  requestIdHeader: "x-request-id",
+});
 ```
 
 ---
 
 ## CORS Policy
 
-CORS is configured via the `AllowedOrigins` config value. Default policy:
+**Never use `origin: "*"` in production.** Always configure an explicit allowlist.
 
-| Header | Value |
-|---|---|
-| `Access-Control-Allow-Origin` | Configurable (no wildcard in production) |
-| `Access-Control-Allow-Methods` | `GET, POST, PUT, DELETE, OPTIONS` |
-| `Access-Control-Allow-Headers` | `Authorization, Content-Type, X-Request-ID` |
-| `Access-Control-Max-Age` | `300` |
-| `Access-Control-Allow-Credentials` | `true` (only when origin is explicitly listed) |
-
-**Never use `*` for `Access-Control-Allow-Origin` in production.**
+```typescript
+await server.register(cors, {
+  origin: (origin, callback) => {
+    const allowed = config.ALLOWED_ORIGINS; // e.g. ["https://app.rbkl.com"]
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"), false);
+    }
+  },
+  credentials: true,
+  maxAge: 300,
+});
+```
 
 ---
 
 _[← Project Structure](project-structure.md) · [Logging →](logging.md)_
+
