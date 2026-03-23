@@ -58,6 +58,9 @@
 - Error logging rules
 
 ### 9. [Testing](docs/testing.md)
+
+Implement unit tests and integration tests everytime you implement a new feature. Consider existing tests as working and do never disable/comment them without explicit instructions. Follow testing standards from the company guidelines, and ensure all new code is covered by tests. If a new issue is found in existing code, fix it and add tests to cover that case
+
 - **Vitest** for unit and integration tests
 - **React Testing Library** for component tests
 - **Supertest** for HTTP integration tests
