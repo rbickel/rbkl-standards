@@ -2,6 +2,19 @@
 
 > **Audience:** Engineers and AI coding agents at RBKL. This wiki defines the official development standards, best practices, and required libraries for all software built within the organization.
 
+## Must-Know Standards (read before coding)
+
+- Stack + tooling: TypeScript in strict mode (no `any`/`@ts-ignore`), Node.js 20, React 18, Fastify v4, Pino v9, Prisma v5, pnpm workspaces only (no npm/yarn). Keep business logic in services and Prisma access inside repositories, not route handlers.
+- Config: Validate all env vars with Zod at startup and exit on failure; use env vars as the single source; secrets come from Azure Key Vault/Managed Identity only; `.env.example` is required; never expose secrets with `VITE_`.
+- AuthZ/AuthN: OIDC with Entra ID using `jose`/`@fastify/jwt`; validate issuer, audience, tenant, exp/nbf on every request; enforce RBAC roles per route; never bypass auth in dev; service-to-service auth uses Managed Identity; do not store tokens in `localStorage`.
+- HTTP servers: Use Fastify plugins, TypeBox/JSON Schema validation at the boundary, explicit CORS allowlists (no `"*"`), and required `/healthz` + `/readyz` endpoints. Set reasonable timeouts/body limits and keep route handlers thin.
+- API design: RESTful, versioned paths `/v1/...`, JSON only, errors as RFC 7807 problem+json, cursor pagination for lists, `DELETE` returns 204, support `Idempotency-Key` for retry-safe POSTs when needed.
+- Logging: Pino only via `request.log`; redact auth headers/passwords/tokens/secrets; no `console.log` or string interpolation logs.
+- Database: Prisma migrations for all schema changes, soft deletes via `deletedAt`, map Prisma errors to domain errors, transactions stay short (no external calls), and avoid raw SQL.
+- Security: Apply `@fastify/helmet` + CSP and security headers, sanitize any HTML with DOMPurify before `dangerouslySetInnerHTML`, use rate limiting (`@fastify/rate-limit`), and never trust client-supplied URLs/headers for security decisions.
+- Testing: Add/maintain unit, integration, and Playwright E2E coverage for new work; tests live with the code; minimum 80% coverage; never disable existing tests.
+- CI/CD: GitHub Actions required with typecheck, lint, unit + integration (Postgres), build, audit, secrets scan, coverage gate, Docker build; Playwright runs on `main`; Conventional Commits drive releases.
+
 ## Table of Contents
 
 ### 1. [Overview & Philosophy](docs/overview.md)
